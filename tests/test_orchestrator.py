@@ -20,10 +20,18 @@ from pipeline.action_signal import ActionType
 
 class MockGenerator:
     """返回预置的 action_signal。"""
-    def __init__(self, proposed_action=ActionType.OBSERVE, confidence=0.55, evidence=None):
+    def __init__(
+        self,
+        proposed_action=ActionType.OBSERVE,
+        confidence=0.55,
+        evidence=None,
+        tool_trace=None,
+    ):
         self._action = proposed_action
         self._conf  = confidence
         self._ev    = evidence or ["mock_evidence"]
+        self._tool_trace = tool_trace or []
+        self.regenerate_calls = 0
 
     async def generate(self, query):
         return {
@@ -35,10 +43,22 @@ class MockGenerator:
                 "proposed_action": self._action,
             },
             "skill_trace": [{"skill": "mock_skill", "key_finding": "mock"}],
+            "tool_trace": self._tool_trace,
+            "evidence_records": [],
         }
 
     async def regenerate(self, query, challenges):
+        self.regenerate_calls += 1
         return await self.generate(query + " (regenerated)")
+
+
+class RepairingGenerator(MockGenerator):
+    """第一次缺少 tool_trace，返修后补上 assess_risk。"""
+
+    async def regenerate(self, query, challenges):
+        self.regenerate_calls += 1
+        self._tool_trace = [{"name": "assess_risk", "arguments": {}, "success": True}]
+        return await self.generate(query + " (prestop repaired)")
 
 
 class MockReviewer:
@@ -52,6 +72,48 @@ class MockReviewer:
             "verdict": self._verdict,
             "challenges": self._challenges,
             "confidence_adjusted": 0.50,
+        }
+
+
+class PrecheckRejectThenPassReviewer:
+    """模拟 Checker precheck 首轮驳回、返修后通过。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def review(self, gen_output):
+        self.calls += 1
+        if self.calls == 1:
+            return {
+                "verdict": "REJECT",
+                "reject_type": "NEED_MORE_TOOL_USE",
+                "challenges": [{
+                    "type": "MISSING_REQUIRED_TOOL",
+                    "description": "缺少风险评估工具调用",
+                    "suggested_fix": "请补调 assess_risk",
+                }],
+                "prestop_result": {"status": "REPAIR", "issues": []},
+            }
+        return {
+            "verdict": "PASS",
+            "challenges": [],
+            "prestop_result": {"status": "PASS", "issues": []},
+        }
+
+
+class AlwaysPrecheckRejectReviewer:
+    """模拟 Checker precheck 返修后仍驳回。"""
+
+    async def review(self, gen_output):
+        return {
+            "verdict": "REJECT",
+            "reject_type": "NEED_MORE_TOOL_USE",
+            "challenges": [{
+                "type": "MISSING_REQUIRED_TOOL",
+                "description": "仍缺少风险评估工具调用",
+                "suggested_fix": "请补调 assess_risk",
+            }],
+            "prestop_result": {"status": "REPAIR", "issues": []},
         }
 
 
@@ -156,7 +218,10 @@ class TestOrchestratorPaths:
     # 5. Gate BLOCK → gate_override .......................................
     @pytest.mark.asyncio
     async def test_gate_override(self):
-        gen  = MockGenerator(proposed_action=ActionType.OBSERVE)
+        gen  = MockGenerator(
+            proposed_action=ActionType.OBSERVE,
+            tool_trace=[{"name": "assess_risk", "arguments": {}, "success": True}],
+        )
         rev  = MockReviewer(verdict="PASS")
         # 创建含高危症状的 Gate，但 query 不含症状则不会触发 → 需要手动构造
         # 直接用真实的 SafetyGate + 高危 query
@@ -171,3 +236,33 @@ class TestOrchestratorPaths:
         # LeadAgent 收到的 signal 应已被 Gate 覆盖为 urgent_care
         assert lead.last_signal is not None
         assert lead.last_terminal == Terminal.GATE_OVERRIDE
+
+    # 6. Checker precheck REJECT → repaired PASS → normal ..................
+    @pytest.mark.asyncio
+    async def test_checker_precheck_reject_then_repair_pass(self):
+        gen = RepairingGenerator(proposed_action=ActionType.RECOMMEND_URGENT_CARE)
+        rev = PrecheckRejectThenPassReviewer()
+        orch = _make_orch(gen, rev)
+
+        result = await orch.run("我胸痛呼吸困难")
+
+        assert result["terminal"] == Terminal.NORMAL
+        assert gen.regenerate_calls == 1
+        assert result["rounds"][0]["verdict"] == "REJECT"
+        assert result["rounds"][0]["reject_type"] == "NEED_MORE_TOOL_USE"
+        assert result["rounds"][1]["prestop_result"]["status"] == "PASS"
+
+    # 7. Checker precheck REJECT → still missing → forced_safe .............
+    @pytest.mark.asyncio
+    async def test_checker_precheck_repair_failure_forced_safe(self):
+        gen = MockGenerator(proposed_action=ActionType.RECOMMEND_URGENT_CARE)
+        rev = AlwaysPrecheckRejectReviewer()
+        orch = _make_orch(gen, rev)
+
+        result = await orch.run("我胸痛呼吸困难")
+
+        assert result["terminal"] == Terminal.FORCED_SAFE
+        assert gen.regenerate_calls == 1
+        assert result["rounds"][0]["verdict"] == "REJECT"
+        assert result["rounds"][1]["verdict"] == "REJECT"
+        assert result["rounds"][1]["reject_type"] == "NEED_MORE_TOOL_USE"

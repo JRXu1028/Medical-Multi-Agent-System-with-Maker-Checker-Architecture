@@ -1,0 +1,153 @@
+"""PreStopPolicy 单元测试。
+
+覆盖 v3.3 的确定性过程检查：
+- required tools 漏调拦截
+- action_signal 完整性检查
+- 高置信但无 evidence 的可修复问题
+
+PreStopPolicy 不调用 LLM，不依赖真实 Agent。
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from core.prestop_policy import (
+    PreStopIssueType,
+    PreStopPolicy,
+    PreStopStatus,
+)
+
+
+def test_before_final_repairs_when_symptom_required_tool_missing():
+    policy = PreStopPolicy()
+
+    result = policy.before_final(
+        user_query="我胸痛呼吸困难，需要怎么办",
+        tool_trace=[],
+    )
+
+    assert result.status == PreStopStatus.REPAIR
+    assert result.phase == "before_final"
+    assert result.issues[0].type == PreStopIssueType.MISSING_REQUIRED_TOOL
+    assert result.issues[0].missing_tools == ["assess_risk"]
+    assert "assess_risk" in result.repair_message
+
+
+def test_before_final_passes_when_required_tool_called_successfully():
+    policy = PreStopPolicy()
+
+    result = policy.before_final(
+        user_query="我胸痛呼吸困难，需要怎么办",
+        tool_trace=[
+            {"name": "assess_risk", "arguments": {}, "success": True},
+        ],
+    )
+
+    assert result.status == PreStopStatus.PASS
+
+
+def test_before_final_ignores_failed_required_tool_call():
+    policy = PreStopPolicy()
+
+    result = policy.before_final(
+        user_query="我胸痛",
+        tool_trace=[
+            {"name": "assess_risk", "arguments": {}, "success": False},
+        ],
+    )
+
+    assert result.status == PreStopStatus.REPAIR
+    assert result.issues[0].missing_tools == ["assess_risk"]
+
+
+def test_before_review_repairs_missing_action_signal():
+    policy = PreStopPolicy()
+
+    result = policy.before_review(
+        user_query="普通健康科普",
+        tool_trace=[],
+        evidence=[],
+        action_signal=None,
+        draft_answer="draft",
+    )
+
+    assert result.status == PreStopStatus.REPAIR
+    assert result.issues[0].type == PreStopIssueType.MISSING_ACTION_SIGNAL
+
+
+def test_before_review_repairs_high_confidence_without_evidence():
+    policy = PreStopPolicy()
+
+    result = policy.before_review(
+        user_query="普通健康科普",
+        tool_trace=[],
+        evidence=[],
+        action_signal={
+            "result": "结论",
+            "confidence": 0.9,
+            "proposed_action": "observe",
+            "evidence": [],
+        },
+        draft_answer="draft",
+    )
+
+    assert result.status == PreStopStatus.REPAIR
+    assert result.issues[0].type == PreStopIssueType.EVIDENCE_GAP
+
+
+def test_before_review_passes_with_low_confidence_without_evidence():
+    policy = PreStopPolicy()
+
+    result = policy.before_review(
+        user_query="普通健康科普",
+        tool_trace=[],
+        evidence=[],
+        action_signal={
+            "result": "结论",
+            "confidence": 0.5,
+            "proposed_action": "observe",
+            "evidence": [],
+        },
+        draft_answer="draft",
+    )
+
+    assert result.status == PreStopStatus.PASS
+
+
+def test_route_triggers_can_activate_required_tool_rule():
+    policy = PreStopPolicy()
+
+    result = policy.before_final(
+        user_query="请问怎么办",
+        route_decision={"triggers": ["安全红线: 胸痛"]},
+        tool_trace=[],
+    )
+
+    assert result.status == PreStopStatus.REPAIR
+    assert result.issues[0].missing_tools == ["assess_risk"]
+
+
+def test_before_final_requires_drug_safety_lookup_for_medication_question():
+    policy = PreStopPolicy()
+
+    result = policy.before_final(
+        user_query="布洛芬和华法林能一起吃吗？",
+        tool_trace=[],
+    )
+
+    assert result.status == PreStopStatus.REPAIR
+    assert result.issues[0].missing_tools == ["drug_safety_lookup"]
+
+
+def test_before_final_requires_lab_reference_lookup_for_lab_report_question():
+    policy = PreStopPolicy()
+
+    result = policy.before_final(
+        user_query="尿酸 520 的化验单严重吗？",
+        tool_trace=[],
+    )
+
+    assert result.status == PreStopStatus.REPAIR
+    assert result.issues[0].missing_tools == ["lab_reference_lookup"]

@@ -65,8 +65,78 @@ from loguru import logger
 # 复用基础组件
 from agents.base import BaseAgent
 from agents.skill_registry_mixin import SkillRegistryMixin
+from core.prestop_policy import PreStopPolicy, PreStopResult
 
 from pipeline.action_signal import ActionType
+
+
+CHECKER_ISSUE_TYPES = frozenset({
+    "TOOL_GAP",
+    "EVIDENCE_GAP",
+    "SAFETY_RISK",
+    "CONTEXT_GAP",
+    "OUTPUT_BOUNDARY",
+})
+
+
+CHECKER_SYSTEM_PROMPT = """你是 Maker-Checker 架构中的 Checker Agent。
+
+你的职责是审查 Maker 的过程和输出，不生成替代医学答案。
+
+## Two-stage Audit
+
+Reviewer.review() 在调用你之前已经运行 deterministic PreStopPolicy：
+- required tools 是否明显漏调
+- action_signal / proposed_action 是否存在
+- 高置信但无 evidence 的硬缺口
+
+你现在负责 LLM semantic audit，不重复 deterministic precheck 已经能稳定判断的事情。
+
+## Issue Types
+
+只能使用以下 5 类 issue type：
+- TOOL_GAP: 工具路径、工具参数、loaded_skills 与 tool_trace 不一致
+- EVIDENCE_GAP: 证据不足、不支撑结论、过旧、低相关或把非医学证据当证据
+- SAFETY_RISK: 红旗症状、特殊人群、停药/处方/剂量等医疗安全风险
+- CONTEXT_GAP: 关键信息不足但 Maker 强行回答或置信度过高
+- OUTPUT_BOUNDARY: 最终表达缺少边界说明、就医提示或非诊断声明
+
+## Required Cross-check
+
+必须交叉审查：
+- loaded_skills: Maker 加载了哪些 SKILL.md 方法论
+- tool_trace: Maker 实际调用了哪些工具
+- evidence_records: RAG/医学工具返回了哪些结构化证据
+- action_signal: Maker 最终结论、置信度和 proposed_action
+
+示例：
+- loaded_skills 包含 symptom_triage 且用户有高危症状，应看到风险评估或足够安全降级。
+- loaded_skills 包含 medication_safety，应看到药物安全或知识库查证。
+- loaded_skills 包含 lab_report，应看到指标/报告参考查证。
+
+## Verdict
+
+- PASS: 没有实质问题，可以进入 SafetyGate。
+- CHALLENGE: 有可接受的不确定性或轻中度问题，应降低置信度或补充边界，但不需要重做。
+- REJECT: 关键工具路径、证据链或安全边界存在严重问题，应退回 Maker 修正。
+
+## Output JSON
+
+只能输出 JSON，不要输出自然语言解释：
+
+{
+  "verdict": "PASS",
+  "challenges": [
+    {
+      "type": "TOOL_GAP",
+      "description": "具体问题",
+      "severity": "high",
+      "suggested_fix": "给 Maker 的修复要求"
+    }
+  ],
+  "confidence_adjusted": 0.65
+}
+"""
 
 
 # ============================================================================
@@ -157,7 +227,8 @@ class ReviewerAgent(BaseAgent, SkillRegistryMixin):
         self,
         agent_id: str = "reviewer",                     # Agent 标识
         config: Optional[Dict[str, Any]] = None,         # 配置项
-        llm_client=None                                   # LLM 客户端（可选复用）
+        llm_client=None,                                  # LLM 客户端（可选复用）
+        prestop_policy: Optional[PreStopPolicy] = None    # Checker 内部确定性预检策略
     ):
         # ---- 默认配置 -------------------------------------------------------
         config = config or {}
@@ -168,6 +239,9 @@ class ReviewerAgent(BaseAgent, SkillRegistryMixin):
         # ---- 初始化基类 -----------------------------------------------------
         BaseAgent.__init__(self, agent_id, config, llm_client)
         SkillRegistryMixin.__init__(self)
+        # v3.3: PreStopPolicy 归 Checker 管，作为 LLM 审查前的零 token 预检。
+        # 规则模块保持独立，方便单元测试和后续替换 Signal Catalog。
+        self.prestop_policy = prestop_policy or PreStopPolicy()
 
         logger.debug(f"ReviewerAgent initialized (id={agent_id})")
 
@@ -176,7 +250,7 @@ class ReviewerAgent(BaseAgent, SkillRegistryMixin):
     # =========================================================================
 
     def register_tools(self) -> None:
-        """Register verification Skills only; Reviewer must not generate advice."""
+        """注册审查用工具；Checker 只能验证，不能生成治疗建议。"""
         self.register_all_skills(exclude={"recommend_lifestyle", "disease_code"})
 
     # =========================================================================
@@ -184,6 +258,7 @@ class ReviewerAgent(BaseAgent, SkillRegistryMixin):
     # =========================================================================
 
     def get_system_prompt(self) -> str:
+        return CHECKER_SYSTEM_PROMPT
         """返回系统提示词：对抗式证伪 + 审查维度 + 结构化输出。"""
         return """你是临床安全审查专家（Reviewer Agent）。
 
@@ -247,7 +322,18 @@ description、severity（high/medium/low）、suggested_fix"""
         dict
             ReviewerVerdict.to_dict() + skill_trace（审查过程中调用的 Skills）。
         """
-        # 构建结构化审查 prompt（不接触 Generator 的原始上下文）
+        # 第一阶段：确定性预检。这里不调用 LLM，只检查过程是否满足最低门槛。
+        # 如果失败，Checker 直接返回 REJECT，让 Orchestrator 驱动 Maker 返修。
+        precheck = self._run_prestop_precheck(generator_output)
+        generator_output["prestop_result"] = precheck.to_dict()
+        if not precheck.passed:
+            logger.warning(
+                "Reviewer precheck rejected draft before LLM audit | issues={}",
+                len(precheck.issues),
+            )
+            return self._precheck_reject(precheck)
+
+        # 第二阶段：构建结构化审查 prompt（不接触 Generator 的原始上下文）
         review_question = self._build_review_prompt(generator_output)
 
         # 运行 AgentLoop（LLM 可能调验证 Skills 做交叉验证）
@@ -259,9 +345,121 @@ description、severity（high/medium/low）、suggested_fix"""
             "challenges":           result.get("challenges", []),
             "confidence_adjusted":  result.get("confidence_adjusted"),
             "reviewer_skill_trace": result.get("skill_trace", []),
+            "prestop_result":       precheck.to_dict(),
+            "review_stage":         "llm_audit",
         }
 
+    def _run_prestop_precheck(self, generator_output: Dict[str, Any]) -> PreStopResult:
+        """运行 Checker 内部的确定性预检。
+
+        PreStopPolicy 需要看到用户原问、工具轨迹、证据和 action_signal。
+        这些输入来自 Maker 的结构化输出；Reviewer 不读取 Maker 的完整对话历史，
+        因此仍然保持上下文隔离。
+        """
+        action_signal = generator_output.get("action_signal")
+        evidence = list(generator_output.get("evidence_records", []) or [])
+        if isinstance(action_signal, dict):
+            evidence.extend(action_signal.get("evidence", []) or [])
+
+        return self.prestop_policy.before_review(
+            user_query=str(generator_output.get("user_query", "")),
+            route_decision=generator_output.get("route_decision"),
+            tool_trace=generator_output.get("tool_trace", []) or [],
+            evidence=evidence,
+            action_signal=action_signal,
+            draft_answer=generator_output.get("answer"),
+        )
+
+    @staticmethod
+    def _precheck_reject(precheck: PreStopResult) -> Dict[str, Any]:
+        """把 PreStopResult 转成 Checker verdict。
+
+        Orchestrator 不需要理解 PreStopPolicy 的规则细节，只需要把这个
+        REJECT 当作普通 Checker 驳回处理，并把 challenges 传给 Maker.regenerate。
+        """
+        return {
+            "verdict": "REJECT",
+            "reject_type": "NEED_MORE_TOOL_USE",
+            "challenges": ReviewerAgent._prestop_challenges(precheck),
+            "confidence_adjusted": None,
+            "reviewer_skill_trace": [],
+            "prestop_result": precheck.to_dict(),
+            "review_stage": "precheck",
+        }
+
+    @staticmethod
+    def _prestop_challenges(precheck: PreStopResult) -> List[Dict[str, str]]:
+        """把确定性预检问题转成 Maker 可读的返修要求。"""
+        challenges: List[Dict[str, str]] = []
+        for issue in precheck.issues:
+            challenges.append({
+                "type": issue.type,
+                "description": issue.description,
+                "severity": "high" if issue.missing_tools else "medium",
+                "suggested_fix": precheck.repair_message,
+            })
+        return challenges
+
+    def _render_checker_prompt(self, gen_output: Dict[str, Any]) -> str:
+        """渲染 v3.4 Checker 语义审计 prompt。
+
+        这里只传 Maker 的结构化输出，不传 Maker 的完整对话历史。
+        Checker 可以看到 loaded_skills / tool_trace / evidence_records，
+        因而能审查“加载的方法论”和“实际工具路径”是否一致。
+        """
+        signal = gen_output.get("action_signal", {}) or {}
+        loaded_skills = gen_output.get("loaded_skills", []) or []
+        tool_trace = gen_output.get("tool_trace", []) or []
+        evidence_records = gen_output.get("evidence_records", []) or []
+        skill_trace = gen_output.get("skill_trace", []) or []
+        prestop_result = gen_output.get("prestop_result", {}) or {}
+
+        return f"""请审查以下 Maker 输出。你只能审查，不要生成替代医学答案。
+
+## User Query
+{gen_output.get("user_query", "")}
+
+## Maker Draft Answer
+{gen_output.get("answer", "")}
+
+## Action Signal
+{json.dumps(signal, ensure_ascii=False, indent=2)}
+
+## Loaded Skills
+{json.dumps(loaded_skills, ensure_ascii=False, indent=2)}
+
+## Tool Trace
+{json.dumps(tool_trace, ensure_ascii=False, indent=2)}
+
+## Evidence Records
+{json.dumps(evidence_records, ensure_ascii=False, indent=2)}
+
+## Maker Tool Summary
+{json.dumps(skill_trace, ensure_ascii=False, indent=2)}
+
+## Deterministic Precheck Result
+{json.dumps(prestop_result, ensure_ascii=False, indent=2)}
+
+## Required Audit
+1. 检查 loaded_skills 与 tool_trace 是否一致。
+2. 检查 tool_trace 的参数和结果是否支持 action_signal。
+3. 检查 evidence_records 是否支撑关键 claim 和 proposed_action。
+4. 检查是否存在 SAFETY_RISK、CONTEXT_GAP 或 OUTPUT_BOUNDARY。
+5. 不重复 PreStopPolicy 已经稳定检查过的缺失 required-tool 硬问题，除非工具参数或证据语义仍不合理。
+
+## Allowed Issue Types
+TOOL_GAP / EVIDENCE_GAP / SAFETY_RISK / CONTEXT_GAP / OUTPUT_BOUNDARY
+
+## Output JSON Only
+{{
+  "verdict": "PASS",
+  "challenges": [],
+  "confidence_adjusted": 0.7
+}}
+"""
+
     def _build_review_prompt(self, gen_output: Dict[str, Any]) -> str:
+        return self._render_checker_prompt(gen_output)
         """将 Generator 的结构化输出转化为审查 prompt。
 
         关键设计：只传结构化字段，不传 Generator 的完整对话历史。
@@ -277,7 +475,7 @@ description、severity（high/medium/low）、suggested_fix"""
             trace_lines.append(
                 f"  · {t.get('skill', '?')}: {t.get('key_finding', '')}"
             )
-        trace_text = "\n".join(trace_lines) if trace_lines else "（无 Skill 调用记录）"
+        trace_text = "\n".join(trace_lines) if trace_lines else "（无 tool 调用记录）"
 
         return f"""请审查以下临床分析：
 
@@ -315,7 +513,7 @@ description、severity（high/medium/low）、suggested_fix"""
         self,
         result: Dict[str, Any],              # 初始 result dict
         final_response: str,                 # LLM 最终回答
-        skill_results: Optional[List[Dict[str, Any]]] = None  # 本轮 Skill 调用
+        tool_results: Optional[List[Dict[str, Any]]] = None  # 本轮 tool 调用
     ) -> Dict[str, Any]:
         """从 LLM 的最终回答中解析结构化 verdict。
 
@@ -323,8 +521,8 @@ description、severity（high/medium/low）、suggested_fix"""
         这里尝试解析 JSON；解析失败则降级为保守判决（CHALLENGE）。
         """
 
-        # ---- 构建 skill_trace -------------------------------------------------
-        trace = self._build_review_trace(skill_results or [])
+        # ---- 构建 review_trace -----------------------------------------------
+        trace = self._build_review_trace(tool_results or [])
         result["skill_trace"] = trace
 
         # ---- 解析 JSON 判决 ---------------------------------------------------
@@ -349,6 +547,8 @@ description、severity（high/medium/low）、suggested_fix"""
             }
 
         # ---- 写入 result ------------------------------------------------------
+        parsed = self._normalize_verdict_payload(parsed)
+
         result["verdict"]              = parsed.get("verdict", "CHALLENGE")
         result["challenges"]           = parsed.get("challenges", [])
         result["confidence_adjusted"]  = parsed.get("confidence_adjusted")
@@ -363,6 +563,42 @@ description、severity（high/medium/low）、suggested_fix"""
     # =========================================================================
     # 解析辅助
     # =========================================================================
+
+    @staticmethod
+    def _normalize_verdict_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """规范化 Checker LLM 输出。
+
+        v3.4 将 issue type 收敛为 5 类。模型如果沿用旧类型或输出未知类型，
+        这里会保守归一到 CONTEXT_GAP，避免 eval/trace 出现无限类别。
+        """
+        verdict = str(payload.get("verdict", "CHALLENGE")).upper()
+        if verdict not in ReviewerVerdict.VALID_VERDICTS:
+            verdict = "CHALLENGE"
+
+        raw_challenges = payload.get("challenges", []) or []
+        if not isinstance(raw_challenges, list):
+            raw_challenges = []
+
+        normalized_challenges: List[Dict[str, Any]] = []
+        for challenge in raw_challenges:
+            if not isinstance(challenge, dict):
+                continue
+            issue_type = str(challenge.get("type", "CONTEXT_GAP")).upper()
+            if issue_type not in CHECKER_ISSUE_TYPES:
+                issue_type = "CONTEXT_GAP"
+
+            normalized = dict(challenge)
+            normalized["type"] = issue_type
+            normalized.setdefault("severity", "medium")
+            normalized.setdefault("description", "")
+            normalized.setdefault("suggested_fix", "")
+            normalized_challenges.append(normalized)
+
+        return {
+            "verdict": verdict,
+            "challenges": normalized_challenges,
+            "confidence_adjusted": payload.get("confidence_adjusted"),
+        }
 
     @staticmethod
     def _parse_verdict_json(text: str) -> Optional[Dict[str, Any]]:
@@ -403,11 +639,11 @@ description、severity（high/medium/low）、suggested_fix"""
 
     @staticmethod
     def _build_review_trace(
-        skill_results: List[Dict[str, Any]]
+        tool_results: List[Dict[str, Any]]
     ) -> List[Dict[str, str]]:
-        """构建审查过程中的 Skill 调用追踪。"""
+        """构建审查过程中 Reviewer 自己的 tool 调用追踪。"""
         trace = []
-        for sr in skill_results:
+        for sr in tool_results:
             name = sr.get("name", "unknown")
             r    = sr.get("result", {})
             if not isinstance(r, dict):
@@ -427,5 +663,3 @@ description、severity（high/medium/low）、suggested_fix"""
             trace.append({"skill": name, "key_finding": finding})
 
         return trace
-
-

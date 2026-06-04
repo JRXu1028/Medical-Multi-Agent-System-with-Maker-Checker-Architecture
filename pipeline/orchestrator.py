@@ -45,6 +45,7 @@ MakerCheckerOrchestrator.run(user_query)
 · pipeline.safety_gate              — SafetyGate, GateResult, apply_gate_override
 · pipeline.action_signal            — ActionSignal（用于数据传递）
 · agents.lead               — LeadAgent（最终表达）
+· agents.reviewer           — 内部持有 PreStopPolicy，先做确定性预检再做 LLM 审查
 
 =============================================================================
 设计原则
@@ -98,7 +99,7 @@ class MakerCheckerOrchestrator:
         reviewer,         # ReviewerAgent 实例
         safety_gate: SafetyGate,  # 确定性安全检查器
         lead_agent=None,  # LeadAgent 实例（可选，用于最终表达）
-        max_retries: int = 1  # 最大修正次数
+        max_retries: int = 1  # 最大 Reviewer 修正次数
     ):
         self.generator   = generator
         self.reviewer    = reviewer
@@ -137,13 +138,19 @@ class MakerCheckerOrchestrator:
         logger.info(f"MK-CHECK Round 1 START | query={user_query[:60]}")
 
         gen_output = await self.generator.generate(user_query)
+        # v3.3: Checker precheck 需要原始用户问题；真实 Generator 已写入，
+        # 这里再兜底一次，保证 mock / legacy Generator 也满足契约。
+        gen_output.setdefault("user_query", user_query)
+
         verdict    = await self.reviewer.review(gen_output)
 
         rounds_log.append({
             "round": 1,
             "action_signal": gen_output.get("action_signal"),
+            "prestop_result": verdict.get("prestop_result"),
             "verdict": verdict.get("verdict"),
             "challenges": verdict.get("challenges", []),
+            "reject_type": verdict.get("reject_type"),
         })
 
         logger.info(
@@ -167,14 +174,18 @@ class MakerCheckerOrchestrator:
                 user_query,
                 challenges=verdict.get("challenges", [])
             )
+            gen_output.setdefault("user_query", user_query)
+
             # Reviewer 再审查
             verdict = await self.reviewer.review(gen_output)
 
             rounds_log.append({
                 "round": 1 + retry_count,
                 "action_signal": gen_output.get("action_signal"),
+                "prestop_result": verdict.get("prestop_result"),
                 "verdict": verdict.get("verdict"),
                 "challenges": verdict.get("challenges", []),
+                "reject_type": verdict.get("reject_type"),
             })
 
             logger.info(

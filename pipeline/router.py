@@ -447,25 +447,58 @@ SEMANTIC_THRESHOLD = SEMANTIC_HIGH_THRESHOLD
 # Main entry
 # ============================================================================
 
-def _route_without_llm(question: str) -> tuple[RouteDecision | None, str, Optional[float]]:
-    """执行不需要 LLM 的路由层，返回确定决策或待仲裁分数。"""
+def _with_rule_degradation_probe(decision: RouteDecision, question: str) -> RouteDecision:
+    """在同步入口中显式标记语义层降级。
+
+    Router 的规则层可以独立工作；但测试和日志需要知道语义召回层是否不可用。
+    该探测只用于同步 ``route()`` 的低成本可观测性，不改变路由模式。
+    """
+
+    score = _semantic_risk_score(question)
+    if score is not None:
+        return decision
+    return RouteDecision(
+        mode=decision.mode,
+        reason=decision.reason,
+        triggers=decision.triggers,
+        source="rule_degraded",
+        degraded=True,
+    )
+
+
+def _route_without_llm(
+    question: str,
+    *,
+    probe_rule_degradation: bool = False,
+) -> tuple[RouteDecision | None, str, Optional[float]]:
+    """执行不需要 LLM 的路由层，返回确定决策或待仲裁分数。
+
+    ``probe_rule_degradation`` 仅供同步入口使用，用于在规则命中时显式暴露
+    semantic layer 是否不可用；异步入口保持快速规则返回。
+    """
     normalized = question.strip()
     if not normalized:
-        return RouteDecision(
+        decision = RouteDecision(
             mode="simple",
             reason="空输入",
             triggers=["empty_question"],
             source="rule",
-        ), normalized, None
+        )
+        if probe_rule_degradation:
+            decision = _with_rule_degradation_probe(decision, normalized)
+        return decision, normalized, None
 
     intent_hits = _check_non_medical_intent(normalized)
     if intent_hits:
-        return RouteDecision(
+        decision = RouteDecision(
             mode="simple",
             reason=f"非个人医疗决策: {', '.join(intent_hits)}",
             triggers=intent_hits,
             source="rule",
-        ), normalized, None
+        )
+        if probe_rule_degradation:
+            decision = _with_rule_degradation_probe(decision, normalized)
+        return decision, normalized, None
 
     for stage in _MAKER_CHECKER_STAGES:
         decision = stage.evaluate(normalized)
@@ -513,7 +546,10 @@ async def route_async(question: str) -> RouteDecision:
 def route(question: str) -> RouteDecision:
     """同步路由入口；测试和脚本中使用。异步流程请用 route_async()。"""
 
-    decision, normalized, score = _route_without_llm(question)
+    decision, normalized, score = _route_without_llm(
+        question,
+        probe_rule_degradation=True,
+    )
     if decision:
         return decision
 

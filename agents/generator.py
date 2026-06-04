@@ -20,8 +20,8 @@ Orchestrator
     │  调用 generate(user_query)
     ▼
 Generator.generate()
-    │  通过 AgentLoop 运行 LLM → 调 Skills → 生成回答
-    │  post_process_result 从 skill_results 中提取结构化数据
+    │  通过 AgentLoop 运行 LLM → 调 tools → 生成回答
+    │  post_process_result 从 tool_results 中提取结构化数据
     ▼
 返回:
     {
@@ -42,7 +42,7 @@ Generator.generate()
 设计原则
 =============================================================================
 · 只构建，不验证 —— 职责单一
-· 从 skill_results 提取结构化数据，不做 NLP 解析
+· 从 tool_results 提取结构化数据，不做 NLP 解析
 · 置信度计算使用 CONFIDENCE_BASE 配置字典，消除魔法数字
 · RISK_TO_ACTION 是唯一的 risk→action 映射源
 
@@ -57,6 +57,10 @@ from loguru import logger
 
 # 导入基础组件
 from agents.base import BaseAgent
+from agents.evidence_extractor import (
+    extract_evidence_records,
+    merge_evidence_record_summaries,
+)
 from agents.skill_registry_mixin import SkillRegistryMixin
 
 from pipeline.action_signal import (
@@ -98,9 +102,11 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
         # ---- 默认配置 -------------------------------------------------------
         config = config or {}
         config.setdefault("llm_profile", "generator")
-        config.setdefault("max_iterations", 5)       # 允许足够的 Skill 调用
-        config.setdefault("max_tool_calls", 3)       # Generator 需要更多 Skill 调用
+        config.setdefault("max_iterations", 5)       # 允许足够的 tool 调用
+        config.setdefault("max_tool_calls", 3)       # Generator 需要更多 tool 调用
         config.setdefault("temperature", 0.7)        # 生成温度
+        config.setdefault("progressive_skills_enabled", True)  # v3.2: 启用 SKILL.md 渐进加载
+        config.setdefault("skill_docs_dir", "skills")          # v3.2: 方法论 Skill 文档目录
 
         # ---- 初始化基类 -----------------------------------------------------
         BaseAgent.__init__(self, agent_id, config, llm_client)
@@ -184,9 +190,15 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
 
         # result 已被 post_process_result 增强，包含 action_signal
         return {
+            # v3.3: Checker 内部的 PreStopPolicy 需要基于用户原问做规则扫描，
+            # 不能依赖 regenerate 时拼出来的修正提示文本。
+            "user_query":    user_query,
             "answer":        result.get("answer", ""),
             "action_signal": result.get("action_signal", {}),
             "skill_trace":   result.get("skill_trace", []),
+            "evidence_records": result.get("evidence_records", []),
+            "loaded_skills": result.get("loaded_skills", []),
+            "tool_trace": result.get("tool_trace", []),
         }
 
     async def regenerate(
@@ -216,7 +228,10 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
             f"请重新进行完整的临床分析，逐条修正上述问题后输出。"
         )
 
-        return await self.generate(regenerate_query)
+        regenerated = await self.generate(regenerate_query)
+        # 保留原始用户问题，供 Checker precheck / SafetyGate / trace 使用。
+        regenerated["user_query"] = user_query
+        return regenerated
 
     def _format_challenges(self, challenges: List[Dict[str, str]]) -> str:
         """将 Reviewer 的 challenges 格式化为修正指令文本。"""
@@ -232,31 +247,38 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
         return "\n".join(lines)
 
     # =========================================================================
-    # post_process_result — 从 Skill 返回值提取 ActionSignal
+    # post_process_result — 从 tool 返回值提取 ActionSignal
     # =========================================================================
 
     async def post_process_result(
         self,
         result: Dict[str, Any],              # 初始 result dict
         final_response: str,                 # LLM 最终自然语言回答
-        skill_results: Optional[List[Dict[str, Any]]] = None  # Skill 调用记录
+        tool_results: Optional[List[Dict[str, Any]]] = None  # tool call 记录
     ) -> Dict[str, Any]:
-        """从 Skill 返回值中提取结构化信息，生成 ActionSignal。
+        """从 tool 返回值中提取结构化信息，生成 ActionSignal。
 
-        不解析自然语言 —— 直接读取 Skill 返回的结构化字段。
-        无 skill_results 时降级使用旧正则逻辑（向后兼容）。
+        不解析自然语言 —— 直接读取 tool 返回的结构化字段。
+        无 tool_results 时降级使用旧正则逻辑（向后兼容）。
         """
 
-        # ---- 构建 skill_trace（记录每个 Skill 的关键发现）-------------------
-        skill_trace = self._build_skill_trace(skill_results or [])
+        _tr = tool_results or []
+
+        # ---- 构建 skill_trace（记录每个工具的关键发现）-------------------
+        skill_trace = self._build_skill_trace(_tr)
         result["skill_trace"] = skill_trace
 
-        # ---- 从 skill_results 中提取关键数据 -------------------------------
-        risk_level    = self._extract_risk_level(skill_results or [])
-        evidence      = self._extract_evidence(skill_results or [], final_response)
-        proposed_action = self._determine_action(risk_level, skill_results or [])
+        # ---- 从 tool_results 中提取关键数据 -------------------------------
+        risk_level    = self._extract_risk_level(_tr)
+        evidence_records = extract_evidence_records(_tr)
+        evidence      = self._extract_evidence(_tr, final_response)
+        evidence      = merge_evidence_record_summaries(
+            evidence,
+            evidence_records,
+        )
+        proposed_action = self._determine_action(risk_level, _tr)
         confidence    = self._calculate_confidence(
-            risk_level, evidence, skill_results or []
+            risk_level, evidence, _tr
         )
 
         # ---- 构建 ActionSignal ----------------------------------------------
@@ -267,7 +289,11 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
             proposed_action = proposed_action,
         )
 
-        result["action_signal"] = signal.to_dict()
+        action_signal = signal.to_dict()
+        # v3.1 新增结构化 RAG 证据；保留 ActionSignal.evidence 的旧字符串契约。
+        action_signal["evidence_records"] = evidence_records
+        result["action_signal"] = action_signal
+        result["evidence_records"] = evidence_records
 
         logger.info(
             f"Generator action_signal: action={proposed_action}, "
@@ -282,14 +308,16 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
 
     def _build_skill_trace(
         self,
-        skill_results: List[Dict[str, Any]]
+        tool_results: List[Dict[str, Any]]
     ) -> List[Dict[str, str]]:
-        """构建 skill_trace —— 每个 Skill 的关键发现摘要。
+        """构建 skill_trace —— 每个 tool call 的关键发现摘要。
 
+        注意：skill_trace 这个名字是给下游 Reviewer/Checker 读的日志字段，
+        实际记录的是 tool call，不是 SKILL.md 加载。
         不记录完整返回值（太长），只提取关键的结构化字段。
         """
         trace = []
-        for sr in skill_results:
+        for sr in tool_results:
             name   = sr.get("name", "unknown")
             r      = sr.get("result", {})
             if not isinstance(r, dict):
@@ -322,14 +350,14 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
 
     def _extract_risk_level(
         self,
-        skill_results: List[Dict[str, Any]]
+        tool_results: List[Dict[str, Any]]
     ) -> str:
-        """从 skill_results 中提取 risk_level。
+        """从 tool_results 中提取 risk_level。
 
-        优先读取 assess_risk Skill 返回的结构化 risk_level 字段，
-        无 Skill 结果时返回 "unknown"。
+        优先读取 assess_risk tool 返回的结构化 risk_level 字段，
+        无 tool 结果时返回 "unknown"。
         """
-        for sr in skill_results:
+        for sr in tool_results:
             if sr.get("name") == "assess_risk":
                 r = sr.get("result", {})
                 if isinstance(r, dict):
@@ -340,10 +368,10 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
 
     def _extract_evidence(
         self,
-        skill_results: List[Dict[str, Any]],
+        tool_results: List[Dict[str, Any]],
         final_response: str
     ) -> List[str]:
-        """提取证据列表 —— 从 Skill 返回值中收集结构化证据项。
+        """提取证据列表 —— 从 tool 返回值中收集结构化证据项。
 
         来源优先级：
         1. assess_risk 的 risk_level + recommendation
@@ -353,7 +381,7 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
         """
         evidence: List[str] = []
 
-        for sr in skill_results:
+        for sr in tool_results:
             r = sr.get("result", {})
             if not isinstance(r, dict):
                 continue
@@ -406,9 +434,9 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
     def _determine_action(
         self,
         risk_level: str,               # 提取到的风险等级
-        skill_results: List[Dict[str, Any]]  # Skill 调用记录
+        tool_results: List[Dict[str, Any]]  # tool call 记录
     ) -> str:
-        """根据 Skill 返回值确定 proposed_action。
+        """根据 tool 返回值确定 proposed_action。
 
         优先级：
         1. assess_risk 的 risk_level → RISK_TO_ACTION 映射
@@ -425,16 +453,16 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
             ActionType.RECOMMEND_URGENT_CARE,
             ActionType.RECOMMEND_TEST,
         ):
-            if self._has_skill_result(skill_results, "clinical_guideline"):
+            if self._has_tool_call(tool_results, "clinical_guideline"):
                 action = ActionType.FOLLOW_GUIDELINE
 
         # 如果只有生活方式建议，映射为 lifestyle
         if action in (ActionType.OBSERVE, ActionType.FOLLOW_GUIDELINE):
-            has_lifestyle = self._has_skill_result(
-                skill_results, "recommend_lifestyle"
+            has_lifestyle = self._has_tool_call(
+                tool_results, "recommend_lifestyle"
             )
-            has_risk_info = self._has_skill_result(
-                skill_results, "assess_risk"
+            has_risk_info = self._has_tool_call(
+                tool_results, "assess_risk"
             )
             if has_lifestyle and not has_risk_info:
                 action = ActionType.RECOMMEND_LIFESTYLE
@@ -445,32 +473,32 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
         self,
         risk_level: str,               # 风险等级
         evidence: List[str],           # 证据列表
-        skill_results: List[Dict[str, Any]]  # Skill 调用记录
+        tool_results: List[Dict[str, Any]]  # tool call 记录
     ) -> float:
         """计算 self-assessed confidence。
 
         公式：
-        base = CONFIDENCE_BASE[risk_level 或 有 Skill 用]
+        base = CONFIDENCE_BASE[risk_level 或 有 tool 调用用]
         + 找到权威指南 → +CONFIDENCE_BONUS_GUIDELINE
         - 无证据 → -CONFIDENCE_PENALTY_NO_EVIDENCE
         最终 clamp 到 [0.0, 1.0]
         """
 
         # ---- 基础分 ---------------------------------------------------------
-        if skill_results:
-            # 有 Skill 调用 → 用风险等级驱动的基础分
+        if tool_results:
+            # 有 tool 调用 → 用风险等级驱动的基础分
             base = CONFIDENCE_BASE.get(
                 risk_level,
-                CONFIDENCE_BASE["skill_used"]  # 有 Skill 但未知风险 → 0.70
+                CONFIDENCE_BASE["skill_used"]  # 有 tool 但未知风险 → 0.70
             )
         else:
-            # 无 Skill 调用 → 降级置信度
+            # 无 tool 调用 → 降级置信度
             base = CONFIDENCE_BASE["fallback"]
 
         # ---- 指南奖励 -------------------------------------------------------
-        guideline_found = self._has_skill_result(
-            skill_results, "clinical_guideline"
-        ) or self._has_skill_result(skill_results, "deep_research")
+        guideline_found = self._has_tool_call(
+            tool_results, "clinical_guideline"
+        ) or self._has_tool_call(tool_results, "deep_research")
 
         if guideline_found:
             base += CONFIDENCE_BONUS_GUIDELINE
@@ -486,14 +514,14 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
     # =========================================================================
 
     @staticmethod
-    def _has_skill_result(
-        skill_results: List[Dict[str, Any]],
-        skill_name: str
+    def _has_tool_call(
+        tool_results: List[Dict[str, Any]],
+        tool_name: str
     ) -> bool:
-        """检查是否调用了指定 Skill 且有非空返回。"""
-        for sr in skill_results:
-            if sr.get("name") == skill_name:
-                r = sr.get("result", {})
+        """检查是否调用了指定 tool 且有非空返回。"""
+        for tr in tool_results:
+            if tr.get("name") == tool_name:
+                r = tr.get("result", {})
                 if isinstance(r, dict) and r:
                     return True
         return False
@@ -511,5 +539,3 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
         if last_period > max_len // 2:
             return truncated[: last_period + 1]
         return truncated
-
-

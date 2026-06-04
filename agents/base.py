@@ -1,5 +1,5 @@
 """
-Agent 抽象基类 — LLM 驱动的 Skill 调用 + AgentLoop 执行引擎。
+Agent 抽象基类 — LLM 驱动的 tool 调用 + AgentLoop 执行引擎。
 """
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, List
@@ -102,20 +102,20 @@ class BaseAgent(ABC):
         self,
         result: Dict[str, Any],
         final_response: str,
-        skill_results: Optional[List[Dict[str, Any]]] = None  # 本轮的 Skill 调用记录
+        tool_results: Optional[List[Dict[str, Any]]] = None  # 本轮的 tool call 记录
     ) -> Dict[str, Any]:
         """
-        结果后处理 —— 子类重写以从 Skill 返回值中提取结构化信息。
+        结果后处理 —— 子类重写以从 tool 返回值中提取结构化信息。
 
-        新架构中（Maker-Checker），此方法从 skill_results 中读取
-        各 Skill 的结构化字段（如 assess_risk 的 risk_level、
-        clinical_guideline 的 guideline_title），生成统一的
+        v3 架构中（Maker-Checker），此方法从 tool_results 中读取
+        各 tool 的结构化字段（如 medical_kb_search 的 evidence records、
+        assess_risk 的 risk_level），生成统一的
         ActionSignal，替代旧架构的 NLP 关键词解析。
 
         Args:
             result:         初始结果 dict（包含 answer / iterations / agent_id）。
             final_response: LLM 的最终自然语言响应文本。
-            skill_results:  本轮 AgentLoop 中所有 Skill 调用的完整记录，
+            tool_results:   本轮 AgentLoop 中所有 tool call 的完整记录，
                             每项包含 {"name", "arguments", "result"}。
                             None 表示旧代码路径（向后兼容）。
 

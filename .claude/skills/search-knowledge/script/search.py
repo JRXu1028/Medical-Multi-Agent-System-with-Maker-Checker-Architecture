@@ -1,121 +1,71 @@
+"""Search Knowledge legacy skill wrapper。
+
+这个文件仍然暴露旧架构需要的 search_knowledge 函数名，
+但内部已经委托给 v3 tools.medical_kb_search。
+这样 SkillLoader 不需要立刻大改，同时 RAG 输出升级为结构化 evidence records。
 """
-Search Knowledge Skill
-搜索医学知识库 Skill（自包含，无需依赖tools）
-"""
-from typing import Dict, Any
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any, Dict, List
+
 from loguru import logger
 
-# 全局知识库实例（避免重复加载模型）
-_kb_instance = None
-
-
-def get_knowledge_base():
-    """获取知识库单例"""
-    global _kb_instance
-    if _kb_instance is None:
-        from knowledge.milvus_kb import MedicalKnowledgeBase
-        _kb_instance = MedicalKnowledgeBase()
-    return _kb_instance
+from tools.medical_kb_search import medical_kb_search
 
 
 async def search_knowledge(query: str, max_results: int = 5) -> Dict[str, Any]:
-    """
-    搜索医学知识库
-
-    Args:
-        query: 查询内容
-        max_results: 最多返回结果数（默认5）
-
-    Returns:
-        {
-            "answer": "格式化的知识库检索结果",
-            "total_found": 检索到的结果数,
-            "query": "原始查询"
-        }
-    """
-    logger.info(f"Searching knowledge base: query={query}, max_results={max_results}")
-
-    # 获取知识库单例（避免重复加载模型）
-    kb = get_knowledge_base()
-
-    # 使用 Milvus 进行语义检索
-    results = kb.search(
-        query=query,
-        top_k=max_results,
-        filter_type=None
+    """检索医学知识库，兼容旧字段并新增 evidence。"""
+    logger.info(
+        "Searching medical knowledge via v3 tool: query={}, max_results={}",
+        query,
+        max_results,
     )
 
-    # 格式化结果
-    formatted_results = []
-    for doc in results:
-        formatted_results.append({
-            "title": f"关于{doc['metadata'].get('disease', query)}的医学信息",
-            "content": doc["content"],
-            "source": doc["metadata"].get("source", "医学知识库"),
-            "score": doc["score"],
-            "type": doc["metadata"].get("type")
-        })
+    tool_result = await medical_kb_search(query=query, max_results=max_results)
+    evidence = tool_result.get("evidence", []) if tool_result.get("success") else []
 
-    # Skill 的格式化输出
-    if formatted_results:
-        return {
-            "answer": format_results(formatted_results),
-            "total_found": len(formatted_results),
-            "query": query
-        }
-    else:
-        return {
-            "answer": f"未找到关于'{query}'的相关医学知识，请尝试更具体的查询。",
-            "total_found": 0,
-            "query": query
-        }
+    return {
+        # 旧字段：继续给 Agent observation 一段可读摘要，避免现有 prompt 完全失效。
+        "answer": format_evidence(evidence, query),
+        "total_found": len(evidence),
+        "query": query,
+        # 新字段：给 Maker/Checker 后处理使用的结构化证据。
+        "evidence": evidence,
+        "tool_result": tool_result,
+    }
 
 
-def format_results(results: list) -> str:
-    """
-    格式化知识库检索结果
+def format_evidence(evidence: List[Dict[str, Any]], query: str) -> str:
+    """把结构化 evidence 简短格式化为 observation 文本。"""
+    if not evidence:
+        return f"未找到关于“{query}”的相关医学知识。"
 
-    Args:
-        results: 检索结果列表
+    lines: List[str] = []
+    for index, item in enumerate(evidence, 1):
+        title = item.get("title") or "未命名证据"
+        snippet = item.get("snippet") or ""
+        citation = item.get("citation") or item.get("source") or "local_medical_kb"
+        score = item.get("score", 0)
 
-    Returns:
-        格式化的字符串
-    """
-    if not results:
-        return "未找到相关信息。"
+        lines.append(f"【证据 {index}】{title}")
+        lines.append(str(snippet))
+        lines.append(f"来源: {citation}")
+        if isinstance(score, (int, float)) and score > 0:
+            lines.append(f"相关度: {score:.2%}")
+        lines.append("")
 
-    output = []
-    for i, doc in enumerate(results, 1):
-        output.append(f"【结果 {i}】")
-        output.append(doc.get("content", "无内容"))
-
-        # 显示相关度分数（如果有）
-        score = doc.get("score", 0)
-        if score > 0:
-            output.append(f"相关度: {score:.2%}")
-
-        output.append("")  # 空行分隔
-
-    return "\n".join(output)
+    return "\n".join(lines).strip()
 
 
-# 同步版本（如果需要）
 def search_knowledge_sync(query: str, max_results: int = 5) -> Dict[str, Any]:
-    """同步版本的搜索知识库"""
-    import asyncio
+    """同步包装，供脚本调试或旧调用方使用。"""
     return asyncio.run(search_knowledge(query, max_results))
 
 
 if __name__ == "__main__":
-    # 测试
-    import asyncio
-
     test_query = "高血压的治疗方法"
     result = asyncio.run(search_knowledge(test_query))
-
-    print("=" * 70)
-    print(f"查询: {test_query}")
-    print("=" * 70)
     print(result["answer"])
-    print("=" * 70)
-    print(f"找到结果数: {result['total_found']}")
+    print(f"evidence_count={len(result['evidence'])}")
