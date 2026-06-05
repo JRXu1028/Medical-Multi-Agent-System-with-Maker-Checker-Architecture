@@ -1,0 +1,1 @@
+{"id": "case_001", "query": "布洛芬和华法林能一起吃吗？", "tags": ["tool_call", "medication_safety"], "expected_route": "maker_checker", "expected_tools": ["drug_safety_lookup"], "expected_evidence_types": ["drug_safety"], "seeded_errors": [], "expected_checker_issues": ["TOOL_GAP"], "metadata": {}}

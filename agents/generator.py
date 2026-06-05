@@ -27,7 +27,8 @@ Generator.generate()
     {
         "answer":        "...",   # LLM 的完整自然语言回答
         "action_signal": {...},   # ActionSignal.to_dict()
-        "skill_trace":   [...]    # 每个 Skill 的关键发现摘要
+        "evidence_records": [...], # 顶层结构化证据实体
+        "process_trace": {...}     # loaded_skills/tool_trace/tool_summary
     }
 
 =============================================================================
@@ -62,6 +63,7 @@ from agents.evidence_extractor import (
     merge_evidence_record_summaries,
 )
 from agents.skill_registry_mixin import SkillRegistryMixin
+from core.llm_client import LLMClient
 
 from pipeline.action_signal import (
     ActionSignal,
@@ -104,9 +106,11 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
         config.setdefault("llm_profile", "generator")
         config.setdefault("max_iterations", 5)       # 允许足够的 tool 调用
         config.setdefault("max_tool_calls", 3)       # Generator 需要更多 tool 调用
-        config.setdefault("temperature", 0.7)        # 生成温度
+        config.setdefault("temperature", 0.3)        # 生成温度：医疗综合回答需要稳，不宜过高
         config.setdefault("progressive_skills_enabled", True)  # v3.2: 启用 SKILL.md 渐进加载
         config.setdefault("skill_docs_dir", "skills")          # v3.2: 方法论 Skill 文档目录
+        config.setdefault("skill_selection_llm_profile", "skill_selector")  # 轻量模型选择 Skills
+        config.setdefault("repair_llm_profile", "generator_repair")  # REJECT 返修轮升级推理预算
 
         # ---- 初始化基类 -----------------------------------------------------
         BaseAgent.__init__(self, agent_id, config, llm_client)
@@ -123,6 +127,7 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
     def register_tools(self) -> None:
         """注册全部 9 个 Skills（委托给 SkillRegistryMixin）。"""
         self.register_all_skills()
+        self.register_structured_tools()
 
     # =========================================================================
     # 系统提示词 — 综合分析 + 结构化输出
@@ -182,7 +187,8 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
             {
                 "answer":         str,    # LLM 完整自然语言回答
                 "action_signal":  dict,   # ActionSignal.to_dict()
-                "skill_trace":    list,   # [{skill, key_finding}, ...]
+                "evidence_records": list, # 顶层结构化证据实体
+                "process_trace":  dict,   # loaded_skills/tool_trace/tool_summary
             }
         """
         input_data = {"question": user_query}
@@ -195,10 +201,8 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
             "user_query":    user_query,
             "answer":        result.get("answer", ""),
             "action_signal": result.get("action_signal", {}),
-            "skill_trace":   result.get("skill_trace", []),
             "evidence_records": result.get("evidence_records", []),
-            "loaded_skills": result.get("loaded_skills", []),
-            "tool_trace": result.get("tool_trace", []),
+            "process_trace": result.get("process_trace", {}),
         }
 
     async def regenerate(
@@ -228,10 +232,38 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
             f"请重新进行完整的临床分析，逐条修正上述问题后输出。"
         )
 
-        regenerated = await self.generate(regenerate_query)
+        regenerated = await self._generate_with_repair_profile(regenerate_query)
         # 保留原始用户问题，供 Checker precheck / SafetyGate / trace 使用。
         regenerated["user_query"] = user_query
+        regenerated.setdefault("process_trace", {})
+        regenerated["process_trace"]["repair_profile"] = self.config.get("repair_llm_profile")
         return regenerated
+
+    async def _generate_with_repair_profile(self, regenerate_query: str) -> Dict[str, Any]:
+        """使用 repair LLM profile 运行返修轮。
+
+        Round 1 Maker 默认使用 non-thinking fast profile；只有 Checker / PreStop
+        明确 REJECT 后，返修轮才临时切到 `generator_repair`。这把高成本
+        thinking/strong 模型变成“被审查触发的修复资源”，而不是每次都默认消耗。
+
+        如果测试注入了 fake llm_client，则不切换真实 profile，避免单元测试触发 API。
+        """
+
+        repair_profile = self.config.get("repair_llm_profile")
+        if not repair_profile or getattr(self, "_external_llm_client", False):
+            return await self.generate(regenerate_query)
+
+        original_client = self.llm_client
+        original_profile = self.config.get("llm_profile")
+        self.llm_client = LLMClient(profile=repair_profile)
+        self.config["llm_profile"] = repair_profile
+        logger.info("Generator repair round using LLM profile: {}", repair_profile)
+        try:
+            return await self.generate(regenerate_query)
+        finally:
+            self.llm_client = original_client
+            if original_profile is not None:
+                self.config["llm_profile"] = original_profile
 
     def _format_challenges(self, challenges: List[Dict[str, str]]) -> str:
         """将 Reviewer 的 challenges 格式化为修正指令文本。"""
@@ -259,14 +291,15 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
         """从 tool 返回值中提取结构化信息，生成 ActionSignal。
 
         不解析自然语言 —— 直接读取 tool 返回的结构化字段。
-        无 tool_results 时降级使用旧正则逻辑（向后兼容）。
+        如果本轮没有工具结果，也会生成低证据强度的 ActionSignal，交给 Checker / SafetyGate 继续兜底。
         """
 
         _tr = tool_results or []
 
-        # ---- 构建 skill_trace（记录每个工具的关键发现）-------------------
-        skill_trace = self._build_skill_trace(_tr)
-        result["skill_trace"] = skill_trace
+        # ---- 构建 process_trace.tool_summary（记录每个工具的关键发现）----
+        process_trace = dict(result.get("process_trace", {}) or {})
+        process_trace["tool_summary"] = self._build_tool_summary(_tr)
+        result["process_trace"] = process_trace
 
         # ---- 从 tool_results 中提取关键数据 -------------------------------
         risk_level    = self._extract_risk_level(_tr)
@@ -290,8 +323,12 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
         )
 
         action_signal = signal.to_dict()
-        # v3.1 新增结构化 RAG 证据；保留 ActionSignal.evidence 的旧字符串契约。
-        action_signal["evidence_records"] = evidence_records
+        # 完整结构化证据只放顶层 evidence_records；action_signal 只保留引用 id 和短摘要。
+        action_signal["evidence_ids"] = [
+            str(item.get("id"))
+            for item in evidence_records
+            if item.get("id")
+        ]
         result["action_signal"] = action_signal
         result["evidence_records"] = evidence_records
 
@@ -306,14 +343,13 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
     # 提取辅助方法
     # =========================================================================
 
-    def _build_skill_trace(
+    def _build_tool_summary(
         self,
         tool_results: List[Dict[str, Any]]
     ) -> List[Dict[str, str]]:
-        """构建 skill_trace —— 每个 tool call 的关键发现摘要。
+        """构建 tool_summary —— 每个 tool call 的关键发现摘要。
 
-        注意：skill_trace 这个名字是给下游 Reviewer/Checker 读的日志字段，
-        实际记录的是 tool call，不是 SKILL.md 加载。
+        tool_summary 属于 process_trace，不属于 action_signal。
         不记录完整返回值（太长），只提取关键的结构化字段。
         """
         trace = []
@@ -321,7 +357,7 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
             name   = sr.get("name", "unknown")
             r      = sr.get("result", {})
             if not isinstance(r, dict):
-                trace.append({"skill": name, "key_finding": str(r)[:100]})
+                trace.append({"tool": name, "key_finding": str(r)[:100]})
                 continue
 
             # 根据 Skill 类型提取关键字段
@@ -344,7 +380,7 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
             else:
                 finding = str(r.get("answer", ""))[:100]
 
-            trace.append({"skill": name, "key_finding": finding})
+            trace.append({"tool": name, "key_finding": finding})
 
         return trace
 

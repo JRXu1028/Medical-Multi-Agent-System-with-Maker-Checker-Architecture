@@ -7,10 +7,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
 from typing import Any, Dict, Iterable, List, Optional
 
 from loguru import logger
 
+from knowledge.rag_retrieval import (
+    reciprocal_rank_fusion,
+    rerank_evidence,
+    summarize_evidence_quality,
+)
 from tools.specs import EvidenceRecord
 
 
@@ -74,6 +80,59 @@ class EvidenceService:
         )
         return records
 
+    def advanced_search(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        filter_type: Optional[str] = None,
+        evidence_type: Optional[str] = None,
+        retrieval_mode: str = "hybrid",
+    ) -> List[EvidenceRecord]:
+        """执行 v3 Future 的高级 RAG 检索。
+
+        `hybrid` 模式会尝试 dense + keyword 两路检索，并用 RRF 融合后再 rerank。
+        如果底层 KB 暂不支持 keyword_search，则自动退化为 dense + rerank，
+        保证高级 RAG 能渐进式落地，而不是强依赖一次性重构 Milvus。
+        """
+        normalized_query = (query or "").strip()
+        if not normalized_query:
+            return []
+
+        mode = (retrieval_mode or "hybrid").lower()
+        dense_records = self.search(
+            normalized_query,
+            top_k=max(top_k * 2, top_k),
+            filter_type=filter_type,
+            evidence_type=evidence_type,
+        )
+        dense_records = self._tag_retrieval_source(dense_records, "dense")
+
+        ranked_lists = [dense_records]
+        if mode == "hybrid":
+            keyword_records = self._keyword_search_records(
+                normalized_query,
+                top_k=max(top_k * 2, top_k),
+                filter_type=filter_type,
+                evidence_type=evidence_type,
+            )
+            if keyword_records:
+                ranked_lists.append(self._tag_retrieval_source(keyword_records, "keyword"))
+
+        if len(ranked_lists) == 1:
+            merged = ranked_lists[0]
+        else:
+            merged = reciprocal_rank_fusion(
+                ranked_lists,
+                top_k=max(top_k * 3, top_k),
+            )
+
+        return rerank_evidence(merged, normalized_query, top_k=top_k)
+
+    def quality_summary(self, records: List[EvidenceRecord]) -> Dict[str, Any]:
+        """返回自动可计算的证据质量摘要，不包含医学主观判断字段。"""
+        return summarize_evidence_quality(records).to_dict()
+
     def search_as_dicts(
         self,
         query: str,
@@ -130,6 +189,54 @@ class EvidenceService:
             citation=self._build_citation(title, organization, year, source),
             metadata=self._compact_metadata(metadata),
         )
+
+    def _keyword_search_records(
+        self,
+        query: str,
+        *,
+        top_k: int,
+        filter_type: Optional[str],
+        evidence_type: Optional[str],
+    ) -> List[EvidenceRecord]:
+        """从支持 keyword_search 的 KB 获取词面检索结果。"""
+        keyword_search = getattr(self.kb, "keyword_search", None)
+        if not callable(keyword_search):
+            return []
+
+        raw_docs = keyword_search(
+            query=query,
+            top_k=max(1, int(top_k)),
+            filter_type=filter_type,
+        )
+        records: List[EvidenceRecord] = []
+        for doc in raw_docs:
+            if isinstance(doc, EvidenceRecord):
+                records.append(doc)
+                continue
+            if not isinstance(doc, dict):
+                continue
+            records.append(
+                self._to_evidence_record(
+                    raw_doc=doc,
+                    fallback_query=query,
+                    fallback_type=evidence_type or self._type_from_filter(filter_type),
+                )
+            )
+        return records
+
+    @staticmethod
+    def _tag_retrieval_source(
+        records: List[EvidenceRecord],
+        source: str,
+    ) -> List[EvidenceRecord]:
+        """给证据补充 retrieval_source，便于 trace/eval 审计检索来源。"""
+        return [
+            replace(
+                record,
+                metadata={**record.metadata, "retrieval_source": source},
+            )
+            for record in records
+        ]
 
     @staticmethod
     def _type_from_filter(filter_type: Optional[str]) -> str:

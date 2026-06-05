@@ -2,9 +2,10 @@
 
 PreStopPolicy 是纯规则组件，不调用 LLM，不生成最终答案。
 它由 Reviewer/Checker 在调用 LLM 审查前执行，只检查 Maker draft 的过程是否完整：
-- 触发关键医疗场景时，必需工具是否被调用
+- 工具路径审查：触发关键医疗场景时，必需工具是否被调用
+- 证据路径审查：高置信或证据型回答是否有结构化 evidence 支撑
+- 安全流程审查：高风险问题是否走过必要安全流程
 - action_signal 是否存在且包含 proposed_action
-- 高置信回答是否有 evidence 支撑
 
 它不判断最终医学结论是否安全；最终输出内容安全由 SafetyGate 负责。
 它保持为独立模块，是为了方便单元测试和后续替换为 Signal Catalog 规则源。
@@ -27,10 +28,20 @@ class PreStopStatus:
 class PreStopIssueType:
     """PreStopPolicy 的问题类型。"""
 
+    TOOL_GAP = "TOOL_GAP"
+    SAFETY_PROCESS_GAP = "SAFETY_PROCESS_GAP"
     MISSING_REQUIRED_TOOL = "MISSING_REQUIRED_TOOL"
     MISSING_ACTION_SIGNAL = "MISSING_ACTION_SIGNAL"
     MISSING_PROPOSED_ACTION = "MISSING_PROPOSED_ACTION"
     EVIDENCE_GAP = "EVIDENCE_GAP"
+
+
+class PreStopRejectType:
+    """PreStopPolicy 给 Checker 的返修原因。"""
+
+    NEED_MORE_TOOL_USE = "NEED_MORE_TOOL_USE"
+    NEED_MORE_EVIDENCE = "NEED_MORE_EVIDENCE"
+    SAFETY_PROCESS_GAP = "SAFETY_PROCESS_GAP"
 
 
 @dataclass(frozen=True)
@@ -41,6 +52,8 @@ class PreStopIssue:
     description: str
     missing_tools: List[str] = field(default_factory=list)
     rule_name: str = ""
+    audit_scope: str = "process"
+    severity: str = "medium"
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为纯 dict，便于写入 rounds_log / trace。"""
@@ -49,21 +62,31 @@ class PreStopIssue:
             "description": self.description,
             "missing_tools": self.missing_tools,
             "rule_name": self.rule_name,
+            "audit_scope": self.audit_scope,
+            "severity": self.severity,
         }
 
 
 @dataclass(frozen=True)
 class PreStopRule:
-    """required-tool 规则。
+    """过程审查规则。
 
-    patterns 命中 user_query 或 route_decision.triggers 后，required_tools
-    中的工具必须出现在 tool_trace 里。
+    patterns 命中 user_query 或 route_decision.triggers 后：
+    - required_tools 中的工具必须全部出现在 tool_trace 里
+    - any_of_tools 非空时，至少一个工具必须出现在 tool_trace 里
+
+    通过 issue_type / audit_scope 区分“普通工具路径缺口”和“安全流程缺口”。
     """
 
     name: str
     patterns: Sequence[str]
-    required_tools: Sequence[str]
     repair_instruction: str
+    required_tools: Sequence[str] = ()
+    any_of_tools: Sequence[str] = ()
+    issue_type: str = PreStopIssueType.MISSING_REQUIRED_TOOL
+    audit_scope: str = "tool_path"
+    reject_type: str = PreStopRejectType.NEED_MORE_TOOL_USE
+    severity: str = "high"
 
     def matches(self, user_query: str, triggers: Sequence[str]) -> bool:
         """检查规则是否命中 query 或 Router triggers。"""
@@ -83,6 +106,7 @@ class PreStopResult:
     phase: str
     issues: List[PreStopIssue] = field(default_factory=list)
     repair_message: str = ""
+    reject_type: str = PreStopRejectType.NEED_MORE_TOOL_USE
 
     @classmethod
     def pass_(cls, phase: str) -> "PreStopResult":
@@ -95,6 +119,7 @@ class PreStopResult:
         phase: str,
         issues: List[PreStopIssue],
         repair_message: str,
+        reject_type: str = PreStopRejectType.NEED_MORE_TOOL_USE,
     ) -> "PreStopResult":
         """快速构造 REPAIR 结果。"""
         return cls(
@@ -102,6 +127,7 @@ class PreStopResult:
             phase=phase,
             issues=issues,
             repair_message=repair_message,
+            reject_type=reject_type,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -111,6 +137,7 @@ class PreStopResult:
             "phase": self.phase,
             "issues": [issue.to_dict() for issue in self.issues],
             "repair_message": self.repair_message,
+            "reject_type": self.reject_type,
         }
 
     @property
@@ -121,7 +148,7 @@ class PreStopResult:
 
 DEFAULT_REQUIRED_TOOL_RULES: List[PreStopRule] = [
     PreStopRule(
-        name="symptom_requires_risk_assessment",
+        name="high_risk_symptom_requires_risk_assessment",
         patterns=(
             "胸痛",
             "呼吸困难",
@@ -130,12 +157,38 @@ DEFAULT_REQUIRED_TOOL_RULES: List[PreStopRule] = [
             "剧烈头痛",
             "单侧无力",
             "意识模糊",
+            "严重出血",
+            "呕血",
+            "黑便",
+            "视力突然丧失",
         ),
         required_tools=("assess_risk",),
         repair_instruction="用户包含高风险症状信号，必须先调用 assess_risk 做风险评估。",
+        issue_type=PreStopIssueType.SAFETY_PROCESS_GAP,
+        audit_scope="safety_process",
+        reject_type=PreStopRejectType.SAFETY_PROCESS_GAP,
+        severity="high",
     ),
     PreStopRule(
-        name="medication_requires_knowledge_check",
+        name="mental_health_crisis_requires_safety_assessment",
+        patterns=(
+            "自杀",
+            "自残",
+            "轻生",
+            "不想活",
+            "伤害自己",
+            "伤害别人",
+            "结束生命",
+        ),
+        required_tools=("assess_risk",),
+        repair_instruction="用户包含心理危机或伤害风险信号，必须先调用 assess_risk 触发安全评估流程。",
+        issue_type=PreStopIssueType.SAFETY_PROCESS_GAP,
+        audit_scope="safety_process",
+        reject_type=PreStopRejectType.SAFETY_PROCESS_GAP,
+        severity="high",
+    ),
+    PreStopRule(
+        name="medication_safety_requires_drug_lookup",
         patterns=(
             "一起吃",
             "能同服",
@@ -144,12 +197,22 @@ DEFAULT_REQUIRED_TOOL_RULES: List[PreStopRule] = [
             "副作用",
             "禁忌",
             "过敏",
+            "华法林",
+            "抗凝",
+            "胰岛素",
+            "孕妇",
+            "儿童用药",
+            "老人用药",
         ),
         required_tools=("drug_safety_lookup",),
         repair_instruction="用户询问用药安全，必须先调用 drug_safety_lookup 查证药物相互作用、禁忌或漏服边界。",
+        issue_type=PreStopIssueType.SAFETY_PROCESS_GAP,
+        audit_scope="safety_process",
+        reject_type=PreStopRejectType.SAFETY_PROCESS_GAP,
+        severity="high",
     ),
     PreStopRule(
-        name="lab_report_requires_knowledge_check",
+        name="lab_report_requires_reference_lookup",
         patterns=(
             "化验单",
             "检查报告",
@@ -162,6 +225,28 @@ DEFAULT_REQUIRED_TOOL_RULES: List[PreStopRule] = [
         ),
         required_tools=("lab_reference_lookup",),
         repair_instruction="用户询问报告或化验指标解读，必须先调用 lab_reference_lookup 查证指标含义和参考范围。",
+        issue_type=PreStopIssueType.TOOL_GAP,
+        audit_scope="tool_path",
+        reject_type=PreStopRejectType.NEED_MORE_TOOL_USE,
+        severity="medium",
+    ),
+    PreStopRule(
+        name="evidence_research_requires_retrieval",
+        patterns=(
+            "指南",
+            "诊疗规范",
+            "最新证据",
+            "循证",
+            "治疗方案",
+            "怎么治疗",
+            "推荐方案",
+        ),
+        any_of_tools=("guideline_search", "medical_kb_search"),
+        repair_instruction="用户询问指南、治疗方案或循证依据，必须先调用 guideline_search 或 medical_kb_search 获取医学证据。",
+        issue_type=PreStopIssueType.TOOL_GAP,
+        audit_scope="tool_path",
+        reject_type=PreStopRejectType.NEED_MORE_TOOL_USE,
+        severity="medium",
     ),
 ]
 
@@ -197,19 +282,18 @@ class PreStopPolicy:
 
         issues: List[PreStopIssue] = []
         for rule in triggered_rules:
-            missing = [
-                tool for tool in rule.required_tools
-                if tool not in called_tools
-            ]
+            missing = self._missing_tools_for_rule(rule, called_tools)
             if not missing:
                 continue
 
             issues.append(
                 PreStopIssue(
-                    type=PreStopIssueType.MISSING_REQUIRED_TOOL,
+                    type=rule.issue_type,
                     description=rule.repair_instruction,
                     missing_tools=list(missing),
                     rule_name=rule.name,
+                    audit_scope=rule.audit_scope,
+                    severity=rule.severity,
                 )
             )
 
@@ -220,6 +304,7 @@ class PreStopPolicy:
             phase="before_final",
             issues=issues,
             repair_message=self._build_repair_message(issues),
+            reject_type=self._select_reject_type(triggered_rules, issues),
         )
 
     def before_review(
@@ -269,6 +354,8 @@ class PreStopPolicy:
                             f"Maker 给出高置信度 confidence={confidence}，"
                             "但没有 evidence 支撑，必须补充证据或降低置信度。"
                         ),
+                        audit_scope="evidence_path",
+                        severity="medium",
                     )
                 )
 
@@ -279,7 +366,51 @@ class PreStopPolicy:
             phase="before_review",
             issues=issues,
             repair_message=self._build_repair_message(issues),
+            reject_type=self._select_reject_type([], issues),
         )
+
+    @staticmethod
+    def _missing_tools_for_rule(rule: PreStopRule, called_tools: set) -> List[str]:
+        """计算某条规则缺失的工具。
+
+        required_tools 表示全部必需；any_of_tools 表示至少命中一个即可。
+        两者可以同时存在，但默认规则只使用其中一种，保持语义清晰。
+        """
+
+        missing = [
+            tool for tool in rule.required_tools
+            if tool not in called_tools
+        ]
+
+        if rule.any_of_tools and not any(tool in called_tools for tool in rule.any_of_tools):
+            missing.extend(tool for tool in rule.any_of_tools if tool not in missing)
+
+        return missing
+
+    @staticmethod
+    def _select_reject_type(
+        triggered_rules: Sequence[PreStopRule],
+        issues: Sequence[PreStopIssue],
+    ) -> str:
+        """按问题类型选择给 Checker 的 reject_type。
+
+        优先级：
+        1. 安全流程缺口：需要 Maker 补安全流程
+        2. 证据路径缺口：需要 Maker 补证据或降置信
+        3. 其他工具路径缺口：需要 Maker 补工具
+        """
+
+        if any(issue.type == PreStopIssueType.SAFETY_PROCESS_GAP for issue in issues):
+            return PreStopRejectType.SAFETY_PROCESS_GAP
+        if any(issue.type == PreStopIssueType.EVIDENCE_GAP for issue in issues):
+            return PreStopRejectType.NEED_MORE_EVIDENCE
+
+        rule_by_name = {rule.name: rule for rule in triggered_rules}
+        for issue in issues:
+            rule = rule_by_name.get(issue.rule_name)
+            if rule is not None:
+                return rule.reject_type
+        return PreStopRejectType.NEED_MORE_TOOL_USE
 
     def _matched_rules(
         self,

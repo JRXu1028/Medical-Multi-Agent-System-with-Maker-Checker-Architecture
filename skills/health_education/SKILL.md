@@ -6,7 +6,7 @@ when_to_load:
   - 用户询问饮水、睡眠、运动等一般健康知识
   - 用户问题不包含紧急症状、个人用药调整或治疗决策
 suggested_tools:
-  - search_knowledge
+  - medical_kb_search
 ---
 
 # Health Education

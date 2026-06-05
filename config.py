@@ -21,6 +21,29 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _thinking_extra_body(
+    *,
+    model_name: str,
+    base_url: str,
+    disable_thinking: bool,
+) -> dict | None:
+    """按供应商生成关闭 thinking 的 extra_body。
+
+    DeepSeek V4 的 OpenAI 兼容接口使用 {"thinking": {"type": "disabled"}}；
+    阿里百炼 / Qwen OpenAI 兼容接口使用 {"enable_thinking": False}。
+    这里统一收敛在配置层，避免业务代码关心供应商差异。
+    """
+
+    if not disable_thinking:
+        return None
+
+    normalized_model = (model_name or "").lower()
+    normalized_base = (base_url or "").lower()
+    if "dashscope.aliyuncs.com" in normalized_base or normalized_model.startswith("qwen"):
+        return {"enable_thinking": False}
+    return {"thinking": {"type": "disabled"}}
+
+
 def _llm_profile(
     prefix: str,
     *,
@@ -50,8 +73,13 @@ def _llm_profile(
         "max_tokens": max_tokens,
         "disable_thinking": disable_thinking,
     }
-    if disable_thinking:
-        config["extra_body"] = {"thinking": {"type": "disabled"}}
+    extra_body = _thinking_extra_body(
+        model_name=model_name,
+        base_url=base_url,
+        disable_thinking=disable_thinking,
+    )
+    if extra_body:
+        config["extra_body"] = extra_body
     return config
 
 
@@ -74,23 +102,32 @@ LLM_PROFILES = {
         default_max_tokens=512,
         default_disable_thinking=True,
     ),
+    "skill_selector": _llm_profile(
+        "SKILL_SELECTOR_LLM",
+        default_model=os.getenv("ROUTER_LLM_MODEL_NAME", "deepseek-v4-flash"),
+        default_temperature=0.0,
+        default_max_tokens=512,
+        default_disable_thinking=True,
+    ),
     "generator": _llm_profile(
         "GENERATOR_LLM",
         default_model=os.getenv("LLM_MODEL_NAME", "deepseek-v4-pro"),
-        default_temperature=0.7,
-        default_max_tokens=8192,
+        default_temperature=0.3,
+        default_max_tokens=2048,
+        default_disable_thinking=True,
+    ),
+    "generator_repair": _llm_profile(
+        "GENERATOR_REPAIR_LLM",
+        default_model=os.getenv("GENERATOR_LLM_MODEL_NAME", os.getenv("LLM_MODEL_NAME", "deepseek-v4-pro")),
+        default_temperature=0.2,
+        default_max_tokens=3000,
+        default_disable_thinking=False,
     ),
     "reviewer": _llm_profile(
         "REVIEWER_LLM",
         default_model=os.getenv("LLM_MODEL_NAME", "deepseek-v4-pro"),
-        default_temperature=0.3,
-        default_max_tokens=8192,
-    ),
-    "lead": _llm_profile(
-        "LEAD_LLM",
-        default_model=os.getenv("LLM_MODEL_NAME", "deepseek-v4-pro"),
-        default_temperature=0.7,
-        default_max_tokens=4096,
+        default_temperature=0.0,
+        default_max_tokens=3072,
     ),
 }
 

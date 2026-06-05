@@ -32,11 +32,11 @@ SafetyGate.check()
     │
     ▼
 GateResult
-    │  .passed = True  → Orchestrator 放行到 LeadAgent
+    │  .passed = True  → Orchestrator 放行到 ResponseRenderer
     │  .passed = False → Orchestrator 调用 apply_gate_override()
     │                    硬覆盖 proposed_action 为 urgent_care
     ▼
-LeadAgent.express()
+ResponseRenderer.render()
     │  读取被覆盖后的 action_signal
     │  用克制语言说明无法可靠排除风险，建议及时就医
     ▼
@@ -47,7 +47,7 @@ Final Answer
 =============================================================================
 · pipeline.action_signal  — 导入 ActionType（用于比较 proposed_action）
 · pipeline.orchestrator — 调用 check() 和 apply_gate_override()
-· agents.lead      — 读取被 Gate 覆盖的 action_signal
+· pipeline.response_renderer — 读取被 Gate 覆盖的 action_signal
 
 =============================================================================
 设计原则
@@ -308,12 +308,12 @@ def apply_gate_override(action_signal: Dict[str, Any]) -> Dict[str, Any]:
     dict
         覆盖后的 action_signal:
         · proposed_action 强制为 recommend_urgent_care
-        · confidence 标记为 "overridden"（LeadAgent 据此标注）
+        · confidence 标记为 "overridden"（ResponseRenderer 据此采用安全模板）
 
     注意
     ----
     confidence 被设为字符串 "overridden" 而非浮点数。
-    这有意为之 —— LeadAgent 检查此标记来决定是否采用安全保护表达。
+    这有意为之 —— 最终渲染层检查此标记来决定是否采用安全保护表达。
     """
 
     overridden = dict(action_signal)                              # 浅拷贝，不动原始 dict

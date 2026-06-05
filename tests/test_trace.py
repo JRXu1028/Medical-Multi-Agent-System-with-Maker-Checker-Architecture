@@ -24,8 +24,10 @@ def test_trace_writer_roundtrip():
             trace_id="trace-001",
             user_query="布洛芬和华法林能一起吃吗？",
             route={"mode": "maker_checker"},
-            loaded_skills=["medication_safety"],
-            tool_trace=[{"name": "drug_safety_lookup", "success": True}],
+            process_trace={
+                "loaded_skills": ["medication_safety"],
+                "tool_trace": [{"name": "drug_safety_lookup", "success": True}],
+            },
             evidence=[
                 EvidenceRecord(
                     id="e1",
@@ -46,7 +48,7 @@ def test_trace_writer_roundtrip():
 
     assert len(records) == 1
     assert records[0]["trace_id"] == "trace-001"
-    assert records[0]["loaded_skills"] == ["medication_safety"]
+    assert records[0]["process_trace"]["loaded_skills"] == ["medication_safety"]
     assert records[0]["evidence"][0]["evidence_type"] == "drug_safety"
 
 

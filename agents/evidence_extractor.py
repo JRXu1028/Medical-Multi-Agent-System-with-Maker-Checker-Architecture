@@ -1,7 +1,7 @@
 """Maker 证据提取工具。
 
 本模块只负责从 AgentLoop 收集到的 tool_results 中提取结构化证据，
-并把结构化 EvidenceRecord 压缩成旧 ActionSignal.evidence 可用的短文本摘要。
+并把结构化 EvidenceRecord 压缩成 ActionSignal.evidence 可用的短文本摘要。
 它不依赖 LLMClient、AgentLoop 或 SkillRegistry，便于单元测试和后续复用。
 """
 
@@ -21,9 +21,9 @@ def extract_evidence_records(
 ) -> List[Dict[str, Any]]:
     """从 tool 返回值中提取结构化 EvidenceRecord。
 
-    兼容两种形态：
-    1. legacy wrapper 顶层返回 {"evidence": [...]}；
-    2. wrapper 内部保留 {"tool_result": {"evidence": [...]}}。
+    支持两种输入形态：
+    1. 现代 ToolResult 顶层返回 {"evidence": [...]}；
+    2. legacy wrapper 内部保留 {"tool_result": {"evidence": [...]}}。
 
     这里仅做数据规范化、容错和去重，不判断医学结论是否成立。
     """
@@ -63,9 +63,9 @@ def merge_evidence_record_summaries(
     *,
     limit: int = 8,
 ) -> List[str]:
-    """把结构化证据压缩成短文本摘要，合并进旧 ActionSignal.evidence。
+    """把结构化证据压缩成短文本摘要，合并进 ActionSignal.evidence。
 
-    SafetyGate 和部分旧逻辑仍读取 evidence: list[str]，所以这里不直接把
+    SafetyGate、ResponseRenderer 和用户侧表达读取 evidence: list[str]，所以这里不直接把
     EvidenceRecord dict 塞进去，而是生成可读、可去重的 brief 文本。
     """
     merged = list(evidence)

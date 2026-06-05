@@ -14,6 +14,8 @@ from loguru import logger
 from pymilvus import MilvusClient
 from sentence_transformers import SentenceTransformer
 
+from knowledge.rag_retrieval import lexical_score
+
 
 class MedicalKnowledgeBase:
     """医学知识库"""
@@ -239,6 +241,62 @@ class MedicalKnowledgeBase:
 
         logger.debug(f"Found {len(documents)} documents")
         return documents
+
+    def keyword_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        filter_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """执行轻量词面检索，作为 hybrid RAG 的 keyword 分支。
+
+        Milvus Lite 不是全文检索引擎，所以这里采用 best-effort 策略：
+        先从 collection 中取一批候选，再用 query overlap 排序。
+        如果底层 query 不可用，返回空列表，让 EvidenceService 自动退化为 dense 检索。
+        """
+        normalized_query = (query or "").strip()
+        if not normalized_query:
+            return []
+
+        filter_expr = None
+        if filter_type:
+            filter_expr = f'metadata like "%\\"type\\": \\"{filter_type}\\"%"'
+
+        try:
+            self._ensure_collection_loaded()
+            raw_items = self.milvus_client.query(
+                collection_name=self.collection_name,
+                filter=filter_expr or "",
+                output_fields=["content", "metadata"],
+                limit=max(top_k * 20, 50),
+            )
+        except Exception as e:
+            logger.debug(f"Keyword search fallback unavailable: {e}")
+            return []
+
+        candidates = []
+        for item in raw_items:
+            try:
+                content = item.get("content") or item.get("entity", {}).get("content", "")
+                metadata_raw = item.get("metadata") or item.get("entity", {}).get("metadata", "{}")
+                metadata = json.loads(metadata_raw) if isinstance(metadata_raw, str) else metadata_raw
+                score = lexical_score(normalized_query, content)
+                if score <= 0:
+                    continue
+                candidates.append(
+                    {
+                        "id": item.get("id") or item.get("pk") or metadata.get("doc_id"),
+                        "content": content,
+                        "metadata": metadata,
+                        "score": score,
+                    }
+                )
+            except Exception as e:
+                logger.debug(f"Failed to parse keyword candidate: {e}")
+                continue
+
+        candidates.sort(key=lambda doc: doc["score"], reverse=True)
+        return candidates[:top_k]
 
     def delete_collection(self):
         """删除 collection（用于测试）"""

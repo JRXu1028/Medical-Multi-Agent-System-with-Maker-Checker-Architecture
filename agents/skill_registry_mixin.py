@@ -47,6 +47,40 @@ class SkillRegistryMixin:
 
         logger.debug(f"Total {len(self.skill_registry.get_all())} skills registered")
 
+    def register_structured_tools(self) -> None:
+        """注册 v3 tools/ 目录下的结构化工具。
+
+        现有 AgentLoop 仍复用 SkillRegistry 的 OpenAI function calling 适配层。
+        因此这里把 ToolSpec + async function 注册进去，让 Maker 能真正调用
+        drug_safety_lookup、lab_reference_lookup、memory_context_lookup 等新工具。
+        """
+
+        from tools.drug_safety_lookup import DRUG_SAFETY_LOOKUP_SPEC, drug_safety_lookup
+        from tools.guideline_search import GUIDELINE_SEARCH_SPEC, guideline_search
+        from tools.lab_reference_lookup import LAB_REFERENCE_LOOKUP_SPEC, lab_reference_lookup
+        from tools.medical_kb_search import MEDICAL_KB_SEARCH_SPEC, medical_kb_search
+        from tools.memory_context_lookup import (
+            MEMORY_CONTEXT_LOOKUP_SPEC,
+            memory_context_lookup,
+        )
+
+        structured_tools = [
+            (MEDICAL_KB_SEARCH_SPEC, medical_kb_search),
+            (GUIDELINE_SEARCH_SPEC, guideline_search),
+            (DRUG_SAFETY_LOOKUP_SPEC, drug_safety_lookup),
+            (LAB_REFERENCE_LOOKUP_SPEC, lab_reference_lookup),
+            (MEMORY_CONTEXT_LOOKUP_SPEC, memory_context_lookup),
+        ]
+
+        for spec, func in structured_tools:
+            self.skill_registry.register(
+                name=spec.name,
+                function=func,
+                description=spec.description,
+                parameters=self._parameters_from_tool_spec(spec),
+            )
+            logger.debug(f"Registered structured tool: {spec.name}")
+
     @staticmethod
     def _normalize_excluded_skills(exclude: Iterable[str]) -> set:
         """Support both kebab-case skill names and snake_case function names."""
@@ -78,6 +112,37 @@ class SkillRegistryMixin:
                     param_type,
                     param_name.replace("_", " ").title(),
                     required,
+                )
+            )
+
+        return parameters
+
+    def _parameters_from_tool_spec(self, spec) -> list:
+        """从 ToolSpec.input_schema 推导 SkillParameter。"""
+
+        schema = spec.input_schema or {}
+        properties = schema.get("properties", {}) or {}
+        required = set(schema.get("required", []) or [])
+        parameters = []
+
+        for name, prop in properties.items():
+            param_type = prop.get("type", "string")
+            if param_type not in {
+                "string",
+                "number",
+                "integer",
+                "boolean",
+                "object",
+                "array",
+            }:
+                param_type = "string"
+            parameters.append(
+                SkillParameter(
+                    name,
+                    param_type,
+                    prop.get("description", name.replace("_", " ").title()),
+                    name in required,
+                    prop.get("enum"),
                 )
             )
 

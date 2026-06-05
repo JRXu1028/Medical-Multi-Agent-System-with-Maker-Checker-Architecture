@@ -61,7 +61,7 @@ class LLMClient:
 
         Args:
             model_type: 模型类型，默认 "openai_compatible"（支持 OpenAI 兼容的 API）
-            profile: LLM 角色配置，如 router / generator / reviewer / lead
+            profile: LLM 角色配置，如 router / skill_selector / generator / generator_repair / reviewer
             config: 显式配置，传入时优先于 profile
         """
         self.model_type = model_type

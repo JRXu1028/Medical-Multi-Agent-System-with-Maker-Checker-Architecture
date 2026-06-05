@@ -6,7 +6,8 @@ when_to_load:
   - 用户提供检查报告并询问严重程度或下一步
   - 用户询问是否需要复查、就医或进一步检查
 suggested_tools:
-  - search_knowledge
+  - lab_reference_lookup
+  - medical_kb_search
   - clinical_guideline
   - assess_risk
 ---

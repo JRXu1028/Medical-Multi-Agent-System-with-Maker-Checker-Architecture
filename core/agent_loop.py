@@ -7,11 +7,12 @@ Agent循环引擎
 """
 import uuid
 import json
+import time
 from typing import Dict, Any, List, Optional
 from loguru import logger
 
 from .state_manager import StateManager, TaskStatus
-from .llm_client import LLMResponse
+from .llm_client import LLMClient, LLMResponse
 from .skill_index import SkillDocLoader
 
 # Harness Engineering: 约束验证和自动修复（可选模块）
@@ -65,6 +66,17 @@ class AgentLoop:
             最终结果
         """
         task_id = str(uuid.uuid4())
+        loop_start = time.perf_counter()
+        timings: Dict[str, Any] = {
+            "agent_loop_total_ms": 0.0,
+            "initialize_messages_ms": 0.0,
+            "skill_selection_ms": 0.0,
+            "llm_total_ms": 0.0,
+            "tool_total_ms": 0.0,
+            "post_process_ms": 0.0,
+            "iterations": [],
+            "tool_calls": [],
+        }
         state = self.state_manager.create_state(
             task_id=task_id,
             agent_id=agent.agent_id,
@@ -81,7 +93,9 @@ class AgentLoop:
             state.status = TaskStatus.IN_PROGRESS
 
             # 初始化消息历史（包含历史对话）
+            t_messages = time.perf_counter()
             messages = self._initialize_messages(agent, input_data, session_id)
+            timings["initialize_messages_ms"] = self._elapsed_ms(t_messages)
             loaded_skills: List[str] = []
             skill_selection: Dict[str, Any] = {
                 "enabled": False,
@@ -103,10 +117,12 @@ class AgentLoop:
             # 这是 AgentLoop 内部的上下文加载步骤，不是 function tool call。
             # 因此它不进入 tool_results，不计入 max_tool_calls，也不生成 evidence。
             if agent.config.get("progressive_skills_enabled", False):
+                t_skill = time.perf_counter()
                 skill_selection = await self._run_skill_selection_pass(
                     agent=agent,
                     messages=messages,
                 )
+                timings["skill_selection_ms"] = self._elapsed_ms(t_skill)
                 loaded_skills = skill_selection.get("loaded_skills", [])
                 skill_context = skill_selection.get("skill_context", "")
                 if skill_context:
@@ -133,15 +149,27 @@ class AgentLoop:
             while state.should_continue():
                 state.iteration += 1
                 logger.debug(f"=== Iteration {state.iteration}/{state.max_iterations} ===")
+                iteration_timing: Dict[str, Any] = {
+                    "iteration": state.iteration,
+                    "llm_ms": 0.0,
+                    "tools_ms": 0.0,
+                    "tool_calls": [],
+                    "finish_reason": "",
+                }
 
                 try:
                     # 调用 LLM（可能返回 tool_calls）
+                    t_llm = time.perf_counter()
                     llm_response: LLMResponse = await agent.llm_client.chat_with_tools(
                         messages=messages,
                         tools=tools_openai_format,
                         tool_choice="auto",
                         temperature=agent.config.get('temperature', 0.7)
                     )
+                    llm_ms = self._elapsed_ms(t_llm)
+                    timings["llm_total_ms"] += llm_ms
+                    iteration_timing["llm_ms"] = llm_ms
+                    iteration_timing["finish_reason"] = llm_response.finish_reason
 
                     # 记录中间结果
                     state.add_intermediate_result({
@@ -200,10 +228,24 @@ class AgentLoop:
                                         f"⚠️ 约束警告: {validation_result.get('reason')}"
                                     )
 
+                            t_tool = time.perf_counter()
                             tool_result = await agent.execute_tool(
                                 tool_name=tool_call.name,
                                 arguments=tool_call.arguments
                             )
+                            tool_ms = self._elapsed_ms(t_tool)
+                            timings["tool_total_ms"] += tool_ms
+                            iteration_timing["tools_ms"] += tool_ms
+                            tool_timing = {
+                                "name": tool_call.name,
+                                "duration_ms": tool_ms,
+                                "success": not (
+                                    isinstance(tool_result, dict)
+                                    and tool_result.get("success") is False
+                                ),
+                            }
+                            iteration_timing["tool_calls"].append(tool_timing)
+                            timings["tool_calls"].append(tool_timing)
 
                             # 收集结构化 tool call 结果，供 post_process_result 使用
                             tool_results.append({
@@ -214,10 +256,8 @@ class AgentLoop:
                             tool_trace.append({
                                 "name": tool_call.name,
                                 "arguments": tool_call.arguments,
-                                "success": not (
-                                    isinstance(tool_result, dict)
-                                    and tool_result.get("success") is False
-                                ),
+                                "success": tool_timing["success"],
+                                "duration_ms": tool_ms,
                             })
 
                             # 添加结果消息
@@ -239,6 +279,7 @@ class AgentLoop:
                                 )
 
                         # 继续下一轮循环
+                        timings["iterations"].append(iteration_timing)
                         continue
 
                     # 情况2: LLM 返回文本响应，任务完成
@@ -282,20 +323,28 @@ class AgentLoop:
                             'answer': final_answer,
                             'iterations': state.iteration,
                             'agent_id': agent.agent_id,
-                            'loaded_skills': loaded_skills,
-                            'tool_trace': tool_trace,
-                            'skill_selection': skill_selection,
+                            'process_trace': {
+                                'loaded_skills': loaded_skills,
+                                'tool_trace': tool_trace,
+                                'skill_selection': skill_selection,
+                                'timings': timings,
+                            },
                         }
 
                         # 让 Agent 进行结果后处理（基于结构化 tool 返回值生成 action_signal）
                         # 传入 tool_results 使 Agent 可直接读取 tool 的结构化字段
                         # 而非从自然语言中做 NLP 关键词解析
                         if hasattr(agent, 'post_process_result'):
+                            t_post = time.perf_counter()
                             result = await agent.post_process_result(
                                 result, final_answer, tool_results=tool_results
                             )
+                            timings["post_process_ms"] += self._elapsed_ms(t_post)
+                            result.setdefault("process_trace", {})
+                            result["process_trace"]["timings"] = timings
 
                         state.mark_completed(result)
+                        timings["iterations"].append(iteration_timing)
                         break
 
                 except Exception as e:
@@ -320,19 +369,27 @@ class AgentLoop:
                     })
 
                     # 调用 LLM（禁用 function calling）
+                    t_fallback_llm = time.perf_counter()
                     final_response = await agent.llm_client.chat_with_tools(
                         messages=messages,
                         tools=None,
                         temperature=0.7
                     )
+                    # fallback LLM 属于 LLM 总耗时，单独标记便于排查 max-iteration 路径。
+                    fallback_llm_ms = self._elapsed_ms(t_fallback_llm)
+                    timings["fallback_llm_ms"] = fallback_llm_ms
+                    timings["llm_total_ms"] += fallback_llm_ms
 
                     result = {
                         'answer': final_response.content or '抱歉，未能完成任务',
                         'iterations': state.iteration,
                         'warning': 'max_iterations_reached',
-                        'loaded_skills': loaded_skills,
-                        'tool_trace': tool_trace,
-                        'skill_selection': skill_selection,
+                        'process_trace': {
+                            'loaded_skills': loaded_skills,
+                            'tool_trace': tool_trace,
+                            'skill_selection': skill_selection,
+                            'timings': timings,
+                        },
                     }
 
                     # 记录最终回答到短期记忆
@@ -354,13 +411,28 @@ class AgentLoop:
                         'iterations': state.iteration,
                         'warning': 'max_iterations_reached',
                         'error': str(e),
-                        'loaded_skills': loaded_skills,
-                        'tool_trace': tool_trace,
-                        'skill_selection': skill_selection,
+                        'process_trace': {
+                            'loaded_skills': loaded_skills,
+                            'tool_trace': tool_trace,
+                            'skill_selection': skill_selection,
+                            'timings': timings,
+                        },
                     }
                     state.mark_completed(result)
 
-            logger.info(f"Agent Loop finished: status={state.status.value}, iterations={state.iteration}")
+            timings["agent_loop_total_ms"] = self._elapsed_ms(loop_start)
+            if state.final_result:
+                state.final_result.setdefault("process_trace", {})
+                state.final_result["process_trace"]["timings"] = timings
+            logger.info(
+                "Agent Loop finished: status={}, iterations={}, total={:.0f}ms, llm={:.0f}ms, tools={:.0f}ms, skill_selection={:.0f}ms",
+                state.status.value,
+                state.iteration,
+                timings["agent_loop_total_ms"],
+                timings["llm_total_ms"],
+                timings["tool_total_ms"],
+                timings["skill_selection_ms"],
+            )
             return state.final_result or {}
 
         except Exception as e:
@@ -396,6 +468,11 @@ class AgentLoop:
 
         return messages
 
+    @staticmethod
+    def _elapsed_ms(start: float) -> float:
+        """返回从 start 到当前的毫秒耗时，统一保留 2 位小数。"""
+        return round((time.perf_counter() - start) * 1000, 2)
+
     async def _run_skill_selection_pass(
         self,
         agent,
@@ -426,7 +503,8 @@ class AgentLoop:
         ]
 
         try:
-            raw_response = await agent.llm_client.chat(
+            selection_client = self._get_skill_selection_client(agent)
+            raw_response = await selection_client.chat(
                 selection_messages,
                 temperature=0.0,
                 max_tokens=800,
@@ -457,6 +535,24 @@ class AgentLoop:
             "skill_context": skill_context,
             "raw_response": raw_response,
         }
+
+    @staticmethod
+    def _get_skill_selection_client(agent):
+        """获取 SkillSelectionPass 使用的轻量 LLM client。
+
+        SkillSelectionPass 只是根据 Skill Index 选择 0-N 个 SKILL.md，属于分类/匹配任务，
+        不应该默认占用 Maker 的强生成模型。测试或特殊 Agent 未配置 profile 时，
+        继续复用 agent.llm_client，避免破坏现有假 LLM 测试。
+        """
+
+        profile = agent.config.get("skill_selection_llm_profile")
+        if not profile:
+            return agent.llm_client
+        cached = getattr(agent, "_skill_selection_llm_client", None)
+        if cached is None:
+            cached = LLMClient(profile=profile)
+            setattr(agent, "_skill_selection_llm_client", cached)
+        return cached
 
     @staticmethod
     def _build_skill_selection_prompt(skill_index: str) -> str:

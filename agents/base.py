@@ -26,6 +26,8 @@ class BaseAgent(ABC):
     ):
         self.agent_id = agent_id
         self.config = config
+        # 单元测试会注入 fake llm_client；这类场景不应触发真实 profile 切换。
+        self._external_llm_client = llm_client is not None
         self.llm_client = llm_client or LLMClient(
             model_type=config.get('model', 'openai_compatible'),
             profile=config.get('llm_profile', agent_id),
@@ -117,7 +119,7 @@ class BaseAgent(ABC):
             final_response: LLM 的最终自然语言响应文本。
             tool_results:   本轮 AgentLoop 中所有 tool call 的完整记录，
                             每项包含 {"name", "arguments", "result"}。
-                            None 表示旧代码路径（向后兼容）。
+                            None 表示本轮没有可执行工具结果。
 
         Returns:
             处理后的 result dict。子类通常在此追加 "action_signal" 键。

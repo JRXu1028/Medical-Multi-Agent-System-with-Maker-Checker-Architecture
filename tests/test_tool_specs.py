@@ -13,7 +13,7 @@ from tools.specs import EvidenceRecord, ToolResult, ToolSpec
 
 
 def test_evidence_record_roundtrip_and_brief():
-    """EvidenceRecord 应能稳定转 dict 并生成旧版兼容摘要。"""
+    """EvidenceRecord 应能稳定转 dict 并生成 ActionSignal 可用摘要。"""
 
     record = EvidenceRecord(
         id="doc-1#0",
@@ -64,12 +64,12 @@ def test_tool_spec_describes_executable_tool_only():
     """ToolSpec 只描述可执行工具，不承担 Skill 文档加载。"""
 
     spec = ToolSpec(
-        name="risk_rule_check",
+        name="assess_risk",
         description="检查红旗症状和风险等级",
         input_schema={"type": "object"},
         output_schema={"type": "object"},
         category="risk",
     )
 
-    assert spec.name == "risk_rule_check"
+    assert spec.name == "assess_risk"
     assert spec.category == "risk"

@@ -1,7 +1,7 @@
 """Generator 结构化证据提取测试。
 
 验证 Maker 后处理可以从 v3 RAG ToolResult 中提取 EvidenceRecord，
-同时保留旧的 ActionSignal.evidence 字符串摘要契约。
+同时保持 ActionSignal.evidence 字符串摘要和 evidence_ids 引用契约。
 """
 
 import sys
@@ -49,7 +49,12 @@ async def test_post_process_result_extracts_structured_evidence_records():
     )
 
     assert result["evidence_records"][0]["id"] == "g1"
-    assert result["action_signal"]["evidence_records"][0]["title"] == "高血压诊疗指南"
+    assert result["action_signal"]["evidence_ids"] == ["g1"]
+    assert "evidence_records" not in result["action_signal"]
+    assert "loaded_skills" not in result
+    assert "tool_trace" not in result
+    assert "skill_trace" not in result
+    assert result["process_trace"]["tool_summary"][0]["tool"] == "clinical_guideline"
     assert any("高血压诊疗指南" in item for item in result["action_signal"]["evidence"])
     assert all(isinstance(item, str) for item in result["action_signal"]["evidence"])
 

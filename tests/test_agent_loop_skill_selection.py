@@ -127,8 +127,11 @@ async def test_skill_selection_pass_loads_skill_context_without_tool_trace():
 
         result = await loop.run(agent, {"question": "我胸痛怎么办"})
 
-        assert result["loaded_skills"] == ["symptom_triage"]
-        assert result["tool_trace"] == []
+        assert result["process_trace"]["loaded_skills"] == ["symptom_triage"]
+        assert result["process_trace"]["tool_trace"] == []
+        assert "loaded_skills" not in result
+        assert "tool_trace" not in result
+        assert "skill_trace" not in result
         assert result["tool_call_count"] == 0
         assert loop.tool_call_count == 0
         assert len(llm_client.chat_calls) == 1
@@ -160,8 +163,8 @@ async def test_skill_selection_disabled_does_not_call_selection_llm():
 
         result = await loop.run(agent, {"question": "我胸痛怎么办"})
 
-        assert result["loaded_skills"] == []
-        assert result["skill_selection"]["enabled"] is False
+        assert result["process_trace"]["loaded_skills"] == []
+        assert result["process_trace"]["skill_selection"]["enabled"] is False
         assert llm_client.chat_calls == []
         assert len(llm_client.chat_with_tools_calls) == 1
 
@@ -185,8 +188,8 @@ async def test_skill_selection_failure_is_recorded_and_main_loop_continues():
         result = await loop.run(agent, {"question": "我胸痛怎么办"})
 
         assert result["answer"] == "最终回答"
-        assert result["loaded_skills"] == []
-        assert result["skill_selection"]["error"] == "skill selection unavailable"
+        assert result["process_trace"]["loaded_skills"] == []
+        assert result["process_trace"]["skill_selection"]["error"] == "skill selection unavailable"
         assert len(llm_client.chat_with_tools_calls) == 1
 
 

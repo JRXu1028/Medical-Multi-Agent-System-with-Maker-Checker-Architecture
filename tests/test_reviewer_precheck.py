@@ -36,14 +36,15 @@ async def test_reviewer_precheck_rejects_without_llm_when_required_tool_missing(
             "proposed_action": "observe",
             "evidence": ["mock evidence"],
         },
-        "tool_trace": [],
+        "process_trace": {"tool_trace": []},
         "evidence_records": [],
     })
 
     assert result["verdict"] == "REJECT"
-    assert result["reject_type"] == "NEED_MORE_TOOL_USE"
+    assert result["reject_type"] == "SAFETY_PROCESS_GAP"
     assert result["review_stage"] == "precheck"
     assert result["prestop_result"]["status"] == "REPAIR"
+    assert result["prestop_result"]["issues"][0]["type"] == "SAFETY_PROCESS_GAP"
     assert result["prestop_result"]["issues"][0]["missing_tools"] == ["assess_risk"]
     assert "assess_risk" in result["challenges"][0]["suggested_fix"]
 
@@ -60,9 +61,11 @@ def test_reviewer_precheck_passes_when_required_tool_called():
             "proposed_action": "urgent_care",
             "evidence": ["risk rule evidence"],
         },
-        "tool_trace": [
-            {"name": "assess_risk", "arguments": {}, "success": True},
-        ],
+        "process_trace": {
+            "tool_trace": [
+                {"name": "assess_risk", "arguments": {}, "success": True},
+            ],
+        },
         "evidence_records": [],
     })
 

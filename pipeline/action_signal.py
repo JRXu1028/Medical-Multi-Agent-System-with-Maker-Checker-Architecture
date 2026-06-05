@@ -22,7 +22,7 @@ Generator.post_process_result()
     ↓  存入 result["action_signal"]
     ↓
 Reviewer.review()
-    ↓  读取 ActionSignal + skill_trace
+    ↓  读取 ActionSignal + evidence_records + process_trace
     ↓  可选重新调用验证 Skills
     ↓  输出 verdict (PASS / CHALLENGE / REJECT)
     ↓
@@ -31,10 +31,10 @@ SafetyGate.check()
     ↓  执行确定性安全检查
     ↓  返回 GateResult (PASS or BLOCK)
     ↓
-LeadAgent.express()
-    ↓  读取最终的 ActionSignal
-    ↓  渲染为面向患者的自然语言
-    ↓  标注是否被 Gate 覆盖或强制安全兜底
+ResponseRenderer.render()
+    ↓  读取最终的 ActionSignal + Maker answer
+    ↓  正常路径直接返回 Maker answer
+    ↓  安全覆盖路径渲染固定兜底模板
 
 =============================================================================
 关联模块

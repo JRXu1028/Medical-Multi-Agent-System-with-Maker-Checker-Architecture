@@ -10,7 +10,7 @@ MakerCheckerOrchestrator 是 Maker-Checker 管道的中央控制器。它：
 2. 根据三种 verdict（PASS/CHALLENGE/REJECT）路由到正确的处理分支
 3. 在 REJECT 超限时触发 FORCED_SAFE_MODE
 4. 调用 SafetyGate 进行确定性安全检查
-5. 将最终结果交给 LeadAgent 表达
+5. 使用 ResponseRenderer 做确定性最终渲染
 
 Orchestrator 使用 Python 代码强制执行判决 ——
 Reviewer 的建议不是"建议"，是被硬编码执行的。
@@ -26,16 +26,16 @@ MakerCheckerOrchestrator.run(user_query)
     │
     ├── Round 1: Generator.generate() → Reviewer.review()
     │     │
-    │     ├── PASS       → SafetyGate → LeadAgent
-    │     ├── CHALLENGE  → 追加 evidence → SafetyGate → LeadAgent
+    │     ├── PASS       → SafetyGate → ResponseRenderer
+    │     ├── CHALLENGE  → 追加 evidence → SafetyGate → ResponseRenderer
     │     └── REJECT     → Round 2
     │
     ├── Round 2: Generator.regenerate(challenges) → Reviewer.review()
     │     │
-    │     ├── PASS/CHALLENGE → SafetyGate → LeadAgent
+    │     ├── PASS/CHALLENGE → SafetyGate → ResponseRenderer
     │     └── REJECT         → FORCED_SAFE_MODE（跳过 Gate）
     │
-    └── LeadAgent.express() → Final Answer
+    └── ResponseRenderer.render() → Final Answer
 
 =============================================================================
 关联模块
@@ -44,7 +44,7 @@ MakerCheckerOrchestrator.run(user_query)
 · agents.reviewer           — ReviewerAgent, ReviewerVerdict
 · pipeline.safety_gate              — SafetyGate, GateResult, apply_gate_override
 · pipeline.action_signal            — ActionSignal（用于数据传递）
-· agents.lead               — LeadAgent（最终表达）
+· pipeline.response_renderer        — ResponseRenderer（确定性最终渲染）
 · agents.reviewer           — 内部持有 PreStopPolicy，先做确定性预检再做 LLM 审查
 
 =============================================================================
@@ -60,6 +60,7 @@ MakerCheckerOrchestrator.run(user_query)
 
 from __future__ import annotations
 
+import time
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -67,6 +68,7 @@ from loguru import logger
 from .action_signal import ActionType
 from .safety_gate import SafetyGate, GateResult, apply_gate_override
 from .terminal import Terminal
+from .response_renderer import ResponseRenderer
 
 
 # ============================================================================
@@ -77,7 +79,7 @@ class MakerCheckerOrchestrator:
     """对抗式 Maker-Checker 流程的总编排器。
 
     管理完整的 Maker-Checker 管道：
-    Round 1 → 判决路由 → Round 2（可选）→ SafetyGate → LeadAgent。
+    Round 1 → 判决路由 → Round 2（可选）→ SafetyGate → ResponseRenderer。
 
     Parameters
     ----------
@@ -87,8 +89,8 @@ class MakerCheckerOrchestrator:
         对抗式审查 Agent。
     safety_gate : SafetyGate
         确定性安全门控。
-    lead_agent : LeadAgent
-        最终表达 Agent（可选，可用简单的 LLM 调用替代）。
+    response_renderer : ResponseRenderer
+        确定性最终渲染器，不调用 LLM，不改写已通过审查的 Maker answer。
     max_retries : int
         最大修正次数，默认 1（即最多 2 轮）。
     """
@@ -98,13 +100,13 @@ class MakerCheckerOrchestrator:
         generator,        # GeneratorAgent 实例
         reviewer,         # ReviewerAgent 实例
         safety_gate: SafetyGate,  # 确定性安全检查器
-        lead_agent=None,  # LeadAgent 实例（可选，用于最终表达）
+        response_renderer: Optional[ResponseRenderer] = None,  # 确定性最终渲染器
         max_retries: int = 1  # 最大 Reviewer 修正次数
     ):
         self.generator   = generator
         self.reviewer    = reviewer
         self.safety_gate = safety_gate
-        self.lead_agent  = lead_agent
+        self.response_renderer = response_renderer or ResponseRenderer()
         self.max_retries = max_retries
 
     # =========================================================================
@@ -131,21 +133,42 @@ class MakerCheckerOrchestrator:
         """
         retry_count = 0          # 已修正次数
         rounds_log: List[Dict] = []  # 轮次记录
+        total_start = time.perf_counter()
+        timings: Dict[str, Any] = {
+            "orchestrator_total_ms": 0.0,
+            "rounds": [],
+            "safety_gate_ms": 0.0,
+            "response_renderer_ms": 0.0,
+        }
 
         # =====================================================================
         # Round 1: 初始生成 + 审查
         # =====================================================================
         logger.info(f"MK-CHECK Round 1 START | query={user_query[:60]}")
 
+        t_generator = time.perf_counter()
         gen_output = await self.generator.generate(user_query)
+        generator_ms = self._elapsed_ms(t_generator)
         # v3.3: Checker precheck 需要原始用户问题；真实 Generator 已写入，
         # 这里再兜底一次，保证 mock / legacy Generator 也满足契约。
         gen_output.setdefault("user_query", user_query)
 
+        t_reviewer = time.perf_counter()
         verdict    = await self.reviewer.review(gen_output)
+        reviewer_ms = self._elapsed_ms(t_reviewer)
+        round_timing = self._build_round_timing(
+            round_index=1,
+            generator_ms=generator_ms,
+            reviewer_ms=reviewer_ms,
+            gen_output=gen_output,
+            verdict=verdict,
+        )
+        timings["rounds"].append(round_timing)
 
         rounds_log.append({
             "round": 1,
+            "timings": round_timing,
+            "answer": gen_output.get("answer", ""),
             "action_signal": gen_output.get("action_signal"),
             "prestop_result": verdict.get("prestop_result"),
             "verdict": verdict.get("verdict"),
@@ -170,17 +193,31 @@ class MakerCheckerOrchestrator:
             )
 
             # Generator 根据 challenges 修正
+            t_generator = time.perf_counter()
             gen_output = await self.generator.regenerate(
                 user_query,
                 challenges=verdict.get("challenges", [])
             )
+            generator_ms = self._elapsed_ms(t_generator)
             gen_output.setdefault("user_query", user_query)
 
             # Reviewer 再审查
+            t_reviewer = time.perf_counter()
             verdict = await self.reviewer.review(gen_output)
+            reviewer_ms = self._elapsed_ms(t_reviewer)
+            round_timing = self._build_round_timing(
+                round_index=1 + retry_count,
+                generator_ms=generator_ms,
+                reviewer_ms=reviewer_ms,
+                gen_output=gen_output,
+                verdict=verdict,
+            )
+            timings["rounds"].append(round_timing)
 
             rounds_log.append({
                 "round": 1 + retry_count,
+                "timings": round_timing,
+                "answer": gen_output.get("answer", ""),
                 "action_signal": gen_output.get("action_signal"),
                 "prestop_result": verdict.get("prestop_result"),
                 "verdict": verdict.get("verdict"),
@@ -200,7 +237,12 @@ class MakerCheckerOrchestrator:
                 f"MK-CHECK: REJECT after {retry_count + 1} rounds → "
                 f"FORCED_SAFE_MODE"
             )
-            return await self._handle_forced_safe(user_query, rounds_log)
+            return await self._handle_forced_safe(
+                user_query,
+                rounds_log,
+                timings=timings,
+                total_start=total_start,
+            )
 
         # =====================================================================
         # CHALLENGE: 追加 evidence，标记 uncertainty
@@ -222,7 +264,9 @@ class MakerCheckerOrchestrator:
         # =====================================================================
         # SafetyGate: 确定性安全检查
         # =====================================================================
+        t_gate = time.perf_counter()
         gate_result = self.safety_gate.check(user_query, signal)
+        timings["safety_gate_ms"] += self._elapsed_ms(t_gate)
         terminal = Terminal.NORMAL
 
         if not gate_result.passed:
@@ -234,16 +278,25 @@ class MakerCheckerOrchestrator:
             signal = apply_gate_override(signal)
             terminal = Terminal.GATE_OVERRIDE
 
-        if verdict.get("verdict") == "CHALLENGE":
-            # 保持 challenged 终态（即使 Gate PASS）
+        if gate_result.passed and verdict.get("verdict") == "CHALLENGE":
+            # Gate override 的安全优先级高于 challenged，只有 Gate PASS 才保留 challenged。
             terminal = Terminal.CHALLENGED
 
         # =====================================================================
-        # LeadAgent 表达
+        # ResponseRenderer 确定性最终渲染
         # =====================================================================
-        final_answer = await self._express(
-            user_query, signal, terminal, rounds_log
+        t_render = time.perf_counter()
+        final_answer = self._render_final_answer(
+            user_query=user_query,
+            maker_answer=gen_output.get("answer", ""),
+            signal=signal,
+            terminal=terminal,
+            rounds_log=rounds_log,
+            challenges=verdict.get("challenges", []),
+            gate_result=gate_result,
         )
+        timings["response_renderer_ms"] += self._elapsed_ms(t_render)
+        timings["orchestrator_total_ms"] = self._elapsed_ms(total_start)
 
         # 结构化日志
         logger.info(
@@ -261,6 +314,7 @@ class MakerCheckerOrchestrator:
                 "gate":   gate_result.gate,
                 "reason": gate_result.reason,
             },
+            "timings": timings,
         }
 
     # =========================================================================
@@ -270,7 +324,9 @@ class MakerCheckerOrchestrator:
     async def _handle_forced_safe(
         self,
         user_query: str,
-        rounds_log: List[Dict]
+        rounds_log: List[Dict],
+        timings: Optional[Dict[str, Any]] = None,
+        total_start: Optional[float] = None,
     ) -> Dict[str, Any]:
         """FORCED_SAFE_MODE: R2 仍 REJECT → 强制输出 urgent_care。
 
@@ -285,38 +341,86 @@ class MakerCheckerOrchestrator:
             "proposed_action": ActionType.RECOMMEND_URGENT_CARE,
         }
 
-        final_answer = await self._express(
-            user_query, signal, Terminal.FORCED_SAFE, rounds_log
+        timings = timings or {
+            "orchestrator_total_ms": 0.0,
+            "rounds": [
+                item.get("timings", {}) for item in rounds_log
+                if isinstance(item, dict)
+            ],
+            "safety_gate_ms": 0.0,
+            "response_renderer_ms": 0.0,
+        }
+        t_render = time.perf_counter()
+        final_answer = self._render_final_answer(
+            user_query=user_query,
+            maker_answer="",
+            signal=signal,
+            terminal=Terminal.FORCED_SAFE,
+            rounds_log=rounds_log,
+            challenges=[],
+            gate_result=None,
         )
+        timings["response_renderer_ms"] = self._elapsed_ms(t_render)
+        if total_start is not None:
+            timings["orchestrator_total_ms"] = self._elapsed_ms(total_start)
 
         return {
             "final_answer": final_answer,
             "terminal":     Terminal.FORCED_SAFE,
             "rounds":       rounds_log,
             "gate_result":  None,  # FORCED_SAFE_MODE 跳过 Gate
+            "timings":      timings,
         }
 
-    async def _express(
+    def _render_final_answer(
         self,
-        user_query: str,          # 用户原始问题
-        signal: Dict[str, Any],   # 最终 action_signal
-        terminal: str,            # 终态类型
-        rounds_log: List[Dict]    # 轮次记录
+        user_query: str,                   # 用户原始问题
+        maker_answer: str,                 # Maker 已生成的原始答案
+        signal: Dict[str, Any],            # 最终 action_signal
+        terminal: str,                     # 终态类型
+        rounds_log: List[Dict],            # 轮次记录
+        challenges: Optional[List[Dict[str, Any]]] = None,
+        gate_result: Optional[GateResult] = None,
     ) -> str:
-        """通过 LeadAgent 将 action_signal 表达为自然语言。"""
+        """用确定性 ResponseRenderer 生成最终答案。
 
-        if self.lead_agent is None:
-            # 无 LeadAgent → 直接返回 action_signal.result
-            return signal.get("result", "抱歉，无法生成回答。")
+        rounds_log 当前只用于保留调用契约和未来 trace 扩展；渲染器不会读取内部过程
+        来重新生成医学结论，避免最终输出层越权。
+        """
 
-        try:
-            return await self.lead_agent.express(
-                user_query=user_query,
-                action_signal=signal,
-                terminal=terminal,
-                rounds=rounds_log,
-            )
-        except Exception as e:
-            logger.error(f"LeadAgent express failed: {e}")
-            return signal.get("result", "抱歉，无法生成回答。")
+        _ = rounds_log
+        return self.response_renderer.render(
+            user_query=user_query,
+            maker_answer=maker_answer,
+            action_signal=signal,
+            terminal=terminal,
+            challenges=challenges,
+            gate_result=gate_result,
+        )
+
+    @staticmethod
+    def _elapsed_ms(start: float) -> float:
+        """返回从 start 到当前的毫秒耗时，统一保留 2 位小数。"""
+        return round((time.perf_counter() - start) * 1000, 2)
+
+    @staticmethod
+    def _build_round_timing(
+        *,
+        round_index: int,
+        generator_ms: float,
+        reviewer_ms: float,
+        gen_output: Dict[str, Any],
+        verdict: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """构造单轮 Maker/Checker 耗时摘要。"""
+
+        generator_trace = gen_output.get("process_trace", {}) or {}
+        reviewer_timing = verdict.get("timings", {}) or {}
+        return {
+            "round": round_index,
+            "generator_ms": generator_ms,
+            "generator_agent_loop": generator_trace.get("timings", {}),
+            "reviewer_ms": reviewer_ms,
+            "reviewer": reviewer_timing,
+        }
 

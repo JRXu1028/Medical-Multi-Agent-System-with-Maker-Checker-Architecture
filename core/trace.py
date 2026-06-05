@@ -21,8 +21,7 @@ class AgentTraceRecord:
     trace_id: str
     user_query: str
     route: Optional[Dict[str, Any]] = None
-    loaded_skills: List[str] = field(default_factory=list)
-    tool_trace: List[Dict[str, Any]] = field(default_factory=list)
+    process_trace: Dict[str, Any] = field(default_factory=dict)
     evidence: List[Dict[str, Any]] = field(default_factory=list)
     prestop_result: Optional[Dict[str, Any]] = None
     checker_verdict: Optional[Dict[str, Any]] = None
@@ -37,8 +36,7 @@ class AgentTraceRecord:
             "trace_id": self.trace_id,
             "user_query": self.user_query,
             "route": _safe_json(self.route),
-            "loaded_skills": list(self.loaded_skills),
-            "tool_trace": _safe_json(self.tool_trace),
+            "process_trace": _safe_json(self.process_trace),
             "evidence": _safe_json(self.evidence),
             "prestop_result": _safe_json(self.prestop_result),
             "checker_verdict": _safe_json(self.checker_verdict),

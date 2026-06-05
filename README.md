@@ -3,16 +3,17 @@
 双 Agent 对抗式临床决策系统：
 
 - **Generator** 调用 9 个医学 Skills 产出综合分析 + action_signal
-- **Reviewer** 以证伪立场独立审查，输出结构化 verdict (PASS/CHALLENGE/REJECT)
+- **Reviewer / Checker** 以证伪立场独立审查，先用 PreStopPolicy 做零 token 工具路径、证据路径和安全流程预检，再输出结构化 verdict (PASS/CHALLENGE/REJECT)
 - **SafetyGate** 确定性代码硬防线 —— 高危症状检查不经过任何 LLM
+- **ResponseRenderer** 确定性最终渲染 —— 通过审查直接返回 Maker 答案，安全覆盖使用固定模板
 - **Router** 自动分流：简单且明确低危的问题走快速通道，高危/复杂/不确定问题走完整对抗管道
 
 ## 架构
 
 ```
 User Query → Router
-              ├── simple:       Generator → SafetyGate → LeadAgent (~60s)
-              └── maker_checker: Generator → Reviewer → SafetyGate → LeadAgent (~130s)
+              ├── simple:       Generator → SafetyGate → ResponseRenderer
+              └── maker_checker: Generator → Reviewer → SafetyGate → ResponseRenderer
                                        ↑__________________|
                                           REJECT → 修正 (≤2轮)
                                           CHALLENGE → 追加evidence
@@ -41,13 +42,13 @@ maker-checker/
 │   ├── base.py                 #   Agent 抽象基类
 │   ├── generator.py            #   临床综合分析 (Maker)
 │   ├── reviewer.py             #   对抗式安全审查 (Checker)
-│   ├── lead.py                 #   最终自然语言表达 (不仲裁)
 │   └── skill_registry_mixin.py #   Skill 自动注册
 ├── pipeline/                   # "流程怎么走" — 管道调度
 │   ├── action_signal.py        #   结构化通信协议
 │   ├── safety_gate.py          #   确定性安全门 (纯代码, 非 LLM)
 │   ├── router.py               #   Hybrid Medical Router 分流
-│   ├── orchestrator.py         #   Generator → Reviewer → Gate → Lead
+│   ├── orchestrator.py         #   Generator → Reviewer → Gate → Renderer
+│   ├── response_renderer.py    #   确定性最终渲染 (非 LLM)
 │   ├── terminal.py             #   四种终态标识
 │   └── entry.py                #   对外入口 process()
 ├── core/                       # "系统怎么跑" — 底层运行时
@@ -73,6 +74,12 @@ pip install -r requirements.txt
 cp .env.example .env
 # 然后在 .env 中填写 LLM_API_KEY / MEM0_API_KEY
 
+# 推荐：Maker 第一轮默认 non-thinking，被 Checker REJECT 后再切 repair thinking。
+GENERATOR_LLM_DISABLE_THINKING=true
+GENERATOR_LLM_MAX_TOKENS=2048
+GENERATOR_REPAIR_LLM_DISABLE_THINKING=false
+GENERATOR_REPAIR_LLM_MAX_TOKENS=3000
+
 # 交互模式 (Maker-Checker)
 python main.py
 
@@ -82,6 +89,30 @@ python main.py -v
 # 运行测试
 python -m pytest tests/ -v
 ```
+
+`python main.py` 每次回答都会打印耗时拆解，用来定位慢点：
+
+```
+耗时拆解:
+  total:              18.42s
+  router:             0.84s
+  agent_init:         0.10s
+  orchestrator:       17.48s
+    round 1:
+      generator:      12.31s
+      generator_loop_total: 12.30s
+        skill_select: 0.92s
+        llm_total:    8.40s
+        tools_total:  2.60s
+          tool medical_kb_search: 2.10s
+      checker:        4.80s
+        prestop:      0.00s
+        llm_audit:    4.79s
+    safety_gate:      0.00s
+    renderer:         0.00s
+```
+
+重点看 `skill_select`、`llm_total`、单个 `tool xxx` 和 `checker.llm_audit`。如果出现 “Loading weights” 慢，通常会反映在首次 tool 调用或 RAG 检索工具耗时里。
 
 ## 典型案例
 

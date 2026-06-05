@@ -26,6 +26,9 @@ def test_checker_system_prompt_uses_v3_issue_taxonomy():
     assert "loaded_skills" in prompt
     assert "tool_trace" in prompt
     assert "不生成替代医学答案" in prompt
+    assert "memory_context" in prompt
+    assert "missed_symptom" not in prompt
+    assert "outdated_guideline" not in prompt
 
 
 def test_checker_review_prompt_includes_loaded_skills_tools_and_evidence():
@@ -34,14 +37,16 @@ def test_checker_review_prompt_includes_loaded_skills_tools_and_evidence():
     prompt = reviewer._build_review_prompt({
         "user_query": "布洛芬和华法林能一起吃吗？",
         "answer": "建议咨询医生。",
-        "loaded_skills": ["medication_safety"],
-        "tool_trace": [
+        "process_trace": {
+            "loaded_skills": ["medication_safety"],
+            "tool_trace": [
             {"name": "drug_safety_lookup", "arguments": {"query": "布洛芬 华法林"}, "success": True}
-        ],
+            ],
+            "tool_summary": [{"tool": "drug_safety_lookup", "key_finding": "bleeding risk"}],
+        },
         "evidence_records": [
             {"id": "drug-1", "title": "NSAIDs and warfarin", "evidence_type": "drug_safety"}
         ],
-        "skill_trace": [{"skill": "drug_safety_lookup", "key_finding": "bleeding risk"}],
         "action_signal": {
             "result": "存在相互作用风险",
             "confidence": 0.7,

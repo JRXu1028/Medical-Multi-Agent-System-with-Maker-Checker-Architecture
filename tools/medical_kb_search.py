@@ -40,11 +40,17 @@ async def medical_kb_search(query: str, max_results: int = 5) -> Dict[str, Any]:
     """执行医学知识库检索并返回 ToolResult dict。"""
     try:
         service = get_evidence_service()
-        records = service.search(
+        search_fn = getattr(service, "advanced_search", service.search)
+        records = search_fn(
             query=query,
             top_k=max_results,
             filter_type=None,
             evidence_type="knowledge",
+        )
+        quality_summary = (
+            service.quality_summary(records)
+            if hasattr(service, "quality_summary")
+            else {}
         )
 
         return ToolResult(
@@ -53,6 +59,8 @@ async def medical_kb_search(query: str, max_results: int = 5) -> Dict[str, Any]:
             data={
                 "query": query,
                 "total_found": len(records),
+                "retrieval_mode": "hybrid",
+                "evidence_quality": quality_summary,
             },
             evidence=records,
         ).to_dict()

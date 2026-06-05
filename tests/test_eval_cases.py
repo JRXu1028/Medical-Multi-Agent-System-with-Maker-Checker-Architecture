@@ -42,12 +42,16 @@ def test_real_eval_fixtures_share_schema():
             root / "tool_call_cases.jsonl",
             root / "rag_cases.jsonl",
             root / "checker_seeded_cases.jsonl",
+            root / "memory_cases.jsonl",
         ]
     )
 
-    assert len(cases) >= 8
+    assert len(cases) >= 10
     assert all(case.id and case.query for case in cases)
     assert {"assess_risk", "drug_safety_lookup", "lab_reference_lookup"} <= {
+        tool for case in cases for tool in case.expected_tools
+    }
+    assert "memory_context_lookup" in {
         tool for case in cases for tool in case.expected_tools
     }
 

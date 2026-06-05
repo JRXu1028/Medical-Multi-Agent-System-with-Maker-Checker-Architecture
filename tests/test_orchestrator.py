@@ -1,5 +1,5 @@
 """
-Orchestrator 单元测试 —— 用 mock Agent 覆盖 5 条路径。
+Orchestrator 单元测试 —— 用 mock Agent 覆盖核心终态路径。
 
 不依赖真实 LLM。
 """
@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
 from pipeline.orchestrator import MakerCheckerOrchestrator, Terminal
-from pipeline.safety_gate import SafetyGate, GateResult
+from pipeline.safety_gate import SafetyGate
 from pipeline.action_signal import ActionType
 
 
@@ -42,8 +42,11 @@ class MockGenerator:
                 "confidence": self._conf,
                 "proposed_action": self._action,
             },
-            "skill_trace": [{"skill": "mock_skill", "key_finding": "mock"}],
-            "tool_trace": self._tool_trace,
+            "process_trace": {
+                "loaded_skills": [],
+                "tool_trace": self._tool_trace,
+                "tool_summary": [{"tool": "mock_tool", "key_finding": "mock"}],
+            },
             "evidence_records": [],
         }
 
@@ -117,29 +120,16 @@ class AlwaysPrecheckRejectReviewer:
         }
 
 
-class MockLeadAgent:
-    """记录调用并返回固定回答。"""
-    def __init__(self):
-        self.last_signal = None
-        self.last_terminal = None
-
-    async def express(self, user_query, action_signal, terminal="", rounds=None):
-        self.last_signal = action_signal
-        self.last_terminal = terminal
-        return f"[{terminal}] mock final answer"
-
-
 def _make_gate(**kwargs):
     """创建一个空的、总是 PASS 的 SafetyGate。"""
     return SafetyGate(high_risk_symptoms=frozenset())
 
 
-def _make_orch(generator, reviewer, gate=None, lead=None):
+def _make_orch(generator, reviewer, gate=None):
     return MakerCheckerOrchestrator(
         generator=generator,
         reviewer=reviewer,
         safety_gate=gate or _make_gate(),
-        lead_agent=lead or MockLeadAgent(),
         max_retries=1,
     )
 
@@ -162,6 +152,7 @@ class TestOrchestratorPaths:
         assert len(result["rounds"]) == 1
         assert result["rounds"][0]["verdict"] == "PASS"
         assert result["gate_result"]["passed"] is True
+        assert result["final_answer"] == "mock answer for: test query"
 
     # 2. CHALLENGE → challenged ...........................................
     @pytest.mark.asyncio
@@ -174,6 +165,9 @@ class TestOrchestratorPaths:
 
         result = await orch.run("test")
         assert result["terminal"] == Terminal.CHALLENGED
+        assert result["final_answer"].startswith("mock answer for: test")
+        assert "Checker 对这个回答仍保留一定不确定性" in result["final_answer"]
+        assert "证据不足" in result["final_answer"]
         # evidence 中应追加 challenge 描述
         signal = result["rounds"][0]["action_signal"]
         assert "证据不足" in str(signal.get("evidence", []))
@@ -200,6 +194,7 @@ class TestOrchestratorPaths:
         result = await orch.run("test")
         assert result["terminal"] == Terminal.NORMAL
         assert len(result["rounds"]) == 2  # Round 1 + Round 2
+        assert result["final_answer"] == "mock answer for: test (regenerated)"
 
     # 4. REJECT → REJECT → forced_safe ...................................
     @pytest.mark.asyncio
@@ -213,7 +208,8 @@ class TestOrchestratorPaths:
         result = await orch.run("test")
         assert result["terminal"] == Terminal.FORCED_SAFE
         assert result["gate_result"] is None  # forced_safe 跳过 Gate
-        assert result["final_answer"] is not None  # 有兜底回答
+        assert "无法可靠排除风险" in result["final_answer"]
+        assert "不要仅依据线上回答自行处理" in result["final_answer"]
 
     # 5. Gate BLOCK → gate_override .......................................
     @pytest.mark.asyncio
@@ -226,16 +222,14 @@ class TestOrchestratorPaths:
         # 创建含高危症状的 Gate，但 query 不含症状则不会触发 → 需要手动构造
         # 直接用真实的 SafetyGate + 高危 query
         gate = SafetyGate()
-        lead = MockLeadAgent()
-        orch = MakerCheckerOrchestrator(gen, rev, gate, lead, max_retries=1)
+        orch = MakerCheckerOrchestrator(gen, rev, gate, max_retries=1)
 
         # query 含高危症状 "胸痛" 但 action 是 OBSERVE → Gate BLOCK
         result = await orch.run("我胸痛呼吸困难")
         assert result["terminal"] == Terminal.GATE_OVERRIDE
         assert result["gate_result"]["passed"] is False
-        # LeadAgent 收到的 signal 应已被 Gate 覆盖为 urgent_care
-        assert lead.last_signal is not None
-        assert lead.last_terminal == Terminal.GATE_OVERRIDE
+        assert "无法可靠排除较高风险" in result["final_answer"]
+        assert "mock answer" not in result["final_answer"]
 
     # 6. Checker precheck REJECT → repaired PASS → normal ..................
     @pytest.mark.asyncio
@@ -248,6 +242,7 @@ class TestOrchestratorPaths:
 
         assert result["terminal"] == Terminal.NORMAL
         assert gen.regenerate_calls == 1
+        assert result["final_answer"] == "mock answer for: 我胸痛呼吸困难 (prestop repaired)"
         assert result["rounds"][0]["verdict"] == "REJECT"
         assert result["rounds"][0]["reject_type"] == "NEED_MORE_TOOL_USE"
         assert result["rounds"][1]["prestop_result"]["status"] == "PASS"
@@ -266,3 +261,21 @@ class TestOrchestratorPaths:
         assert result["rounds"][0]["verdict"] == "REJECT"
         assert result["rounds"][1]["verdict"] == "REJECT"
         assert result["rounds"][1]["reject_type"] == "NEED_MORE_TOOL_USE"
+
+    # 8. Gate BLOCK 优先级高于 CHALLENGE ...............................
+    @pytest.mark.asyncio
+    async def test_gate_override_has_priority_over_challenge(self):
+        gen = MockGenerator(
+            proposed_action=ActionType.OBSERVE,
+            tool_trace=[{"name": "assess_risk", "arguments": {}, "success": True}],
+        )
+        rev = MockReviewer(verdict="CHALLENGE", challenges=[
+            {"type": "SAFETY_RISK", "description": "仍需明确急症风险"}
+        ])
+        orch = _make_orch(gen, rev, gate=SafetyGate())
+
+        result = await orch.run("我胸痛呼吸困难")
+
+        assert result["terminal"] == Terminal.GATE_OVERRIDE
+        assert result["gate_result"]["passed"] is False
+        assert "无法可靠排除较高风险" in result["final_answer"]

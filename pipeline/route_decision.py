@@ -19,8 +19,8 @@ class RouteDecision:
     Parameters
     ----------
     mode : RouteMode
-        "simple"       — Generator → SafetyGate → LeadAgent
-        "maker_checker" — Generator → Reviewer → SafetyGate → LeadAgent
+        "simple"       — Generator → SafetyGate → ResponseRenderer
+        "maker_checker" — Generator → Reviewer → SafetyGate → ResponseRenderer
     reason : str
         人类可读的决策原因，用于日志和终端展示。
     triggers : list of str

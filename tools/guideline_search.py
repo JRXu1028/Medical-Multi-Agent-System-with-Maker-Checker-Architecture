@@ -40,11 +40,17 @@ async def guideline_search(query: str, max_results: int = 3) -> Dict[str, Any]:
     """执行临床指南检索并返回 ToolResult dict。"""
     try:
         service = get_evidence_service()
-        records = service.search(
+        search_fn = getattr(service, "advanced_search", service.search)
+        records = search_fn(
             query=f"{query} 临床指南 诊疗规范",
             top_k=max_results,
             filter_type="clinical_guideline",
             evidence_type="clinical_guideline",
+        )
+        quality_summary = (
+            service.quality_summary(records)
+            if hasattr(service, "quality_summary")
+            else {}
         )
 
         return ToolResult(
@@ -53,6 +59,8 @@ async def guideline_search(query: str, max_results: int = 3) -> Dict[str, Any]:
             data={
                 "query": query,
                 "total_found": len(records),
+                "retrieval_mode": "hybrid",
+                "evidence_quality": quality_summary,
             },
             evidence=records,
         ).to_dict()

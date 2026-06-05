@@ -6,7 +6,8 @@ when_to_load:
   - 用户询问漏服、加量、停药、副作用或过敏
   - 用户包含孕妇、儿童、老人、肝肾功能异常等用药风险背景
 suggested_tools:
-  - search_knowledge
+  - drug_safety_lookup
+  - medical_kb_search
   - clinical_guideline
   - assess_risk
 ---
