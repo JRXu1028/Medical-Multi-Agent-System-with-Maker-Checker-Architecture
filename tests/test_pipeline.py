@@ -110,7 +110,9 @@ class TestRouter:
         d = route("多喝水有什么好处")
         assert d.is_simple
         assert d.mode == "simple"
-        assert d.source in ("rule", "rule_degraded")  # 语义可用=rule，不可用=rule_degraded
+        assert d.source == "rule"
+        if d.degraded:
+            assert d.degraded_reason == "semantic_unavailable"
 
     def test_safety_redline_high_risk(self):
         from pipeline.router import route

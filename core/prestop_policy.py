@@ -31,8 +31,7 @@ class PreStopIssueType:
     TOOL_GAP = "TOOL_GAP"
     SAFETY_PROCESS_GAP = "SAFETY_PROCESS_GAP"
     MISSING_REQUIRED_TOOL = "MISSING_REQUIRED_TOOL"
-    MISSING_ACTION_SIGNAL = "MISSING_ACTION_SIGNAL"
-    MISSING_PROPOSED_ACTION = "MISSING_PROPOSED_ACTION"
+    MISSING_URGENCY = "MISSING_URGENCY"
     EVIDENCE_GAP = "EVIDENCE_GAP"
 
 
@@ -314,6 +313,7 @@ class PreStopPolicy:
         route_decision: Optional[Any] = None,
         tool_trace: Optional[List[Dict[str, Any]]] = None,
         evidence: Optional[List[Any]] = None,
+        urgency: Optional[str] = None,
         action_signal: Optional[Dict[str, Any]] = None,
         draft_answer: Optional[str] = None,
     ) -> PreStopResult:
@@ -326,7 +326,30 @@ class PreStopPolicy:
         if not before_final_result.passed:
             return before_final_result
 
+        if isinstance(action_signal, dict):
+            if urgency is None and action_signal.get("proposed_action"):
+                urgency = "emergency" if "urgent" in str(action_signal.get("proposed_action")) else "routine"
+            evidence = list(evidence or []) + list(action_signal.get("evidence", []) or [])
+
         issues: List[PreStopIssue] = []
+
+        if not urgency:
+            issues.append(
+                PreStopIssue(
+                    type=PreStopIssueType.MISSING_URGENCY,
+                    description="Maker output is missing top-level urgency.",
+                )
+            )
+
+        if not issues:
+            return PreStopResult.pass_("before_review")
+
+        return PreStopResult.repair(
+            phase="before_review",
+            issues=issues,
+            repair_message=self._build_repair_message(issues),
+            reject_type=self._select_reject_type([], issues),
+        )
 
         if not action_signal:
             issues.append(

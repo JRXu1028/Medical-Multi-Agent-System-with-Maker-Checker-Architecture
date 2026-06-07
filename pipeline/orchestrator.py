@@ -65,7 +65,6 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from .action_signal import ActionType
 from .safety_gate import SafetyGate, GateResult, apply_gate_override
 from .terminal import Terminal
 from .response_renderer import ResponseRenderer
@@ -169,6 +168,8 @@ class MakerCheckerOrchestrator:
             "round": 1,
             "timings": round_timing,
             "answer": gen_output.get("answer", ""),
+            "urgency": gen_output.get("urgency"),
+            "evidence_records": gen_output.get("evidence_records", []),
             "action_signal": gen_output.get("action_signal"),
             "prestop_result": verdict.get("prestop_result"),
             "verdict": verdict.get("verdict"),
@@ -218,6 +219,8 @@ class MakerCheckerOrchestrator:
                 "round": 1 + retry_count,
                 "timings": round_timing,
                 "answer": gen_output.get("answer", ""),
+                "urgency": gen_output.get("urgency"),
+                "evidence_records": gen_output.get("evidence_records", []),
                 "action_signal": gen_output.get("action_signal"),
                 "prestop_result": verdict.get("prestop_result"),
                 "verdict": verdict.get("verdict"),
@@ -247,18 +250,20 @@ class MakerCheckerOrchestrator:
         # =====================================================================
         # CHALLENGE: 追加 evidence，标记 uncertainty
         # =====================================================================
-        signal = gen_output.get("action_signal", {})
+        signal = gen_output
         if verdict.get("verdict") == "CHALLENGE":
             challenges = verdict.get("challenges", [])
-            evidence = signal.get("evidence", [])
-            for c in challenges:
-                desc = c.get("description", "")
-                if desc and desc not in evidence:
-                    evidence.append(desc)
-            signal["evidence"] = evidence
-            signal["uncertainty"] = True
+            signal["checker_challenged"] = True
+            legacy_signal = signal.get("action_signal")
+            if isinstance(legacy_signal, dict):
+                evidence = legacy_signal.get("evidence", [])
+                for c in challenges:
+                    desc = c.get("description", "")
+                    if desc and desc not in evidence:
+                        evidence.append(desc)
+                legacy_signal["evidence"] = evidence
             logger.info(
-                f"MK-CHECK: CHALLENGE — merged {len(challenges)} notes into evidence"
+                f"MK-CHECK: CHALLENGE | challenges={len(challenges)}"
             )
 
         # =====================================================================
@@ -289,7 +294,7 @@ class MakerCheckerOrchestrator:
         final_answer = self._render_final_answer(
             user_query=user_query,
             maker_answer=gen_output.get("answer", ""),
-            signal=signal,
+            maker_output=signal,
             terminal=terminal,
             rounds_log=rounds_log,
             challenges=verdict.get("challenges", []),
@@ -302,7 +307,7 @@ class MakerCheckerOrchestrator:
         logger.info(
             f"MK-CHECK COMPLETE | terminal={terminal} | "
             f"rounds={len(rounds_log)} | "
-            f"action={signal.get('proposed_action','?')}"
+            f"urgency={signal.get('urgency','?')}"
         )
 
         return {
@@ -335,10 +340,12 @@ class MakerCheckerOrchestrator:
         """
 
         signal: Dict[str, Any] = {
-            "result":          "目前无法可靠排除风险，基于安全原则建议立即就医。",
-            "evidence":        ["系统未能确认低风险，按安全原则建议及时就医"],
-            "confidence":      "forced_safe_mode",    # 非浮点数，标记来源
-            "proposed_action": ActionType.RECOMMEND_URGENT_CARE,
+            "user_query": user_query,
+            "answer": "",
+            "urgency": "emergency",
+            "evidence_records": [],
+            "process_trace": {},
+            "safety_override": "forced_safe",
         }
 
         timings = timings or {
@@ -354,7 +361,7 @@ class MakerCheckerOrchestrator:
         final_answer = self._render_final_answer(
             user_query=user_query,
             maker_answer="",
-            signal=signal,
+            maker_output=signal,
             terminal=Terminal.FORCED_SAFE,
             rounds_log=rounds_log,
             challenges=[],
@@ -376,7 +383,7 @@ class MakerCheckerOrchestrator:
         self,
         user_query: str,                   # 用户原始问题
         maker_answer: str,                 # Maker 已生成的原始答案
-        signal: Dict[str, Any],            # 最终 action_signal
+        maker_output: Dict[str, Any],      # 最终 MakerOutput
         terminal: str,                     # 终态类型
         rounds_log: List[Dict],            # 轮次记录
         challenges: Optional[List[Dict[str, Any]]] = None,
@@ -392,7 +399,7 @@ class MakerCheckerOrchestrator:
         return self.response_renderer.render(
             user_query=user_query,
             maker_answer=maker_answer,
-            action_signal=signal,
+            maker_output=maker_output,
             terminal=terminal,
             challenges=challenges,
             gate_result=gate_result,

@@ -57,19 +57,18 @@ async def process_with_maker_checker(
         t_generator = time.perf_counter()
         gen_result = await gen.generate(question)
         timings["generator_ms"] = _elapsed_ms(t_generator)
-        signal = gen_result["action_signal"]
         t_gate = time.perf_counter()
-        gr = gate.check(question, signal)
+        gr = gate.check(question, gen_result)
         timings["safety_gate_ms"] = _elapsed_ms(t_gate)
         terminal = "simple"
         if not gr.passed:
-            signal = apply_gate_override(signal)
+            gen_result = apply_gate_override(gen_result)
             terminal = "gate_override"
         t_render = time.perf_counter()
         answer = renderer.render(
             user_query=question,
             maker_answer=gen_result.get("answer", ""),
-            action_signal=signal,
+            maker_output=gen_result,
             terminal=terminal,
             gate_result=gr,
         )

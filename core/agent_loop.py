@@ -14,6 +14,8 @@ from loguru import logger
 from .state_manager import StateManager, TaskStatus
 from .llm_client import LLMClient, LLMResponse
 from .skill_index import SkillDocLoader
+from .skill_resolver import SkillResolver
+from .tool_visibility import ToolVisibilityPolicy
 
 # Harness Engineering: 约束验证和自动修复（可选模块）
 CONSTRAINTS_ENABLED = False
@@ -102,6 +104,11 @@ class AgentLoop:
                 "requested_skills": [],
                 "loaded_skills": [],
             }
+            tool_visibility: Dict[str, Any] = {
+                "enabled": False,
+                "visible_tool_names": [],
+                "hidden_tool_names": [],
+            }
 
             # 记录用户消息到短期记忆
             if self.short_term_memory and session_id:
@@ -118,10 +125,20 @@ class AgentLoop:
             # 因此它不进入 tool_results，不计入 max_tool_calls，也不生成 evidence。
             if agent.config.get("progressive_skills_enabled", False):
                 t_skill = time.perf_counter()
-                skill_selection = await self._run_skill_selection_pass(
-                    agent=agent,
-                    messages=messages,
-                )
+                if agent.config.get("skill_selection_strategy") in {
+                    "cluster_hybrid",
+                    "hybrid_resolver",
+                    "resolver",
+                }:
+                    skill_selection = self._run_skill_resolver_pass(
+                        agent=agent,
+                        input_data=input_data,
+                    )
+                else:
+                    skill_selection = await self._run_skill_selection_pass(
+                        agent=agent,
+                        messages=messages,
+                    )
                 timings["skill_selection_ms"] = self._elapsed_ms(t_skill)
                 loaded_skills = skill_selection.get("loaded_skills", [])
                 skill_context = skill_selection.get("skill_context", "")
@@ -136,6 +153,16 @@ class AgentLoop:
 
             # 获取 Agent 的 Skills (OpenAI format)
             tools_openai_format = agent.get_tools_for_llm()
+            if agent.config.get("tool_visibility_control_enabled", False):
+                visibility_result = ToolVisibilityPolicy().filter_tools(
+                    tools=tools_openai_format or [],
+                    loaded_skills=loaded_skills,
+                )
+                tools_openai_format = visibility_result.tools
+                tool_visibility = {
+                    "enabled": True,
+                    **visibility_result.to_dict(),
+                }
 
             logger.debug(f"Agent has {len(tools_openai_format) if tools_openai_format else 0} skills available")
 
@@ -327,6 +354,7 @@ class AgentLoop:
                                 'loaded_skills': loaded_skills,
                                 'tool_trace': tool_trace,
                                 'skill_selection': skill_selection,
+                                'tool_visibility': tool_visibility,
                                 'timings': timings,
                             },
                         }
@@ -388,6 +416,7 @@ class AgentLoop:
                             'loaded_skills': loaded_skills,
                             'tool_trace': tool_trace,
                             'skill_selection': skill_selection,
+                            'tool_visibility': tool_visibility,
                             'timings': timings,
                         },
                     }
@@ -415,6 +444,7 @@ class AgentLoop:
                             'loaded_skills': loaded_skills,
                             'tool_trace': tool_trace,
                             'skill_selection': skill_selection,
+                            'tool_visibility': tool_visibility,
                             'timings': timings,
                         },
                     }
@@ -535,6 +565,64 @@ class AgentLoop:
             "skill_context": skill_context,
             "raw_response": raw_response,
         }
+
+    def _run_skill_resolver_pass(
+        self,
+        agent,
+        input_data: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """运行 Phase C 的本地 SkillResolver。
+
+        与 LLM SkillSelectionPass 一样，它是 AgentLoop 内部上下文加载步骤，
+        不进入 tool_trace，不计入 max_tool_calls，也不生成 evidence。
+        """
+
+        loader = SkillDocLoader(agent.config.get("skill_docs_dir", "skills"))
+        skill_docs = loader.discover()
+        if not skill_docs:
+            return {
+                "enabled": True,
+                "strategy": "cluster_hybrid",
+                "requested_skills": [],
+                "loaded_skills": [],
+                "skill_context": "",
+                "resolver": {"reason": "no_skill_docs"},
+            }
+
+        resolver = SkillResolver(
+            max_skills=int(agent.config.get("skill_resolver_max_skills", 4)),
+        )
+        resolution = resolver.resolve(
+            user_query=self._extract_user_query(input_data),
+            skill_docs=skill_docs,
+        )
+        skill_context, loaded_skills = loader.render_skill_context(
+            resolution.selected_skill_ids
+        )
+
+        logger.debug(
+            "SkillResolver loaded skills: selected={}, loaded={}",
+            resolution.selected_skill_ids,
+            loaded_skills,
+        )
+        return {
+            "enabled": True,
+            "strategy": "cluster_hybrid",
+            "requested_skills": resolution.selected_skill_ids,
+            "loaded_skills": loaded_skills,
+            "skill_context": skill_context,
+            "resolver": resolution.to_dict(),
+        }
+
+    @staticmethod
+    def _extract_user_query(input_data: Dict[str, Any]) -> str:
+        """从 AgentLoop input_data 中提取用户原问。"""
+
+        for key in ("question", "user_query", "query", "input"):
+            value = input_data.get(key)
+            if value:
+                return str(value)
+        return str(input_data)
 
     @staticmethod
     def _get_skill_selection_client(agent):

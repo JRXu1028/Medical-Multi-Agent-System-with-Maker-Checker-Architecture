@@ -65,15 +65,6 @@ from agents.evidence_extractor import (
 from agents.skill_registry_mixin import SkillRegistryMixin
 from core.llm_client import LLMClient
 
-from pipeline.action_signal import (
-    ActionSignal,
-    ActionType,
-    RISK_TO_ACTION,
-    CONFIDENCE_BASE,
-    CONFIDENCE_BONUS_GUIDELINE,
-    CONFIDENCE_PENALTY_NO_EVIDENCE,
-)
-
 
 # ============================================================================
 # GeneratorAgent — Maker
@@ -109,6 +100,9 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
         config.setdefault("temperature", 0.3)        # 生成温度：医疗综合回答需要稳，不宜过高
         config.setdefault("progressive_skills_enabled", True)  # v3.2: 启用 SKILL.md 渐进加载
         config.setdefault("skill_docs_dir", "skills")          # v3.2: 方法论 Skill 文档目录
+        config.setdefault("skill_selection_strategy", "cluster_hybrid")  # Phase C: 本地 SkillResolver
+        config.setdefault("skill_resolver_max_skills", 4)  # 每轮默认加载 2-4 个相关 SKILL.md
+        config.setdefault("tool_visibility_control_enabled", True)  # Phase D: 按 loaded skills 过滤工具
         config.setdefault("skill_selection_llm_profile", "skill_selector")  # 轻量模型选择 Skills
         config.setdefault("repair_llm_profile", "generator_repair")  # REJECT 返修轮升级推理预算
 
@@ -200,7 +194,7 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
             # 不能依赖 regenerate 时拼出来的修正提示文本。
             "user_query":    user_query,
             "answer":        result.get("answer", ""),
-            "action_signal": result.get("action_signal", {}),
+            "urgency":       result.get("urgency", "uncertain"),
             "evidence_records": result.get("evidence_records", []),
             "process_trace": result.get("process_trace", {}),
         }
@@ -304,37 +298,14 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
         # ---- 从 tool_results 中提取关键数据 -------------------------------
         risk_level    = self._extract_risk_level(_tr)
         evidence_records = extract_evidence_records(_tr)
-        evidence      = self._extract_evidence(_tr, final_response)
-        evidence      = merge_evidence_record_summaries(
-            evidence,
-            evidence_records,
-        )
-        proposed_action = self._determine_action(risk_level, _tr)
-        confidence    = self._calculate_confidence(
-            risk_level, evidence, _tr
-        )
+        urgency = self._determine_urgency(risk_level, _tr, evidence_records)
 
-        # ---- 构建 ActionSignal ----------------------------------------------
-        signal = ActionSignal(
-            result          = self._summarize_response(final_response),
-            evidence        = evidence,
-            confidence      = confidence,
-            proposed_action = proposed_action,
-        )
-
-        action_signal = signal.to_dict()
-        # 完整结构化证据只放顶层 evidence_records；action_signal 只保留引用 id 和短摘要。
-        action_signal["evidence_ids"] = [
-            str(item.get("id"))
-            for item in evidence_records
-            if item.get("id")
-        ]
-        result["action_signal"] = action_signal
+        result["urgency"] = urgency
         result["evidence_records"] = evidence_records
 
         logger.info(
-            f"Generator action_signal: action={proposed_action}, "
-            f"confidence={confidence}, evidence_count={signal.evidence_count}"
+            f"Generator maker_output: urgency={urgency}, "
+            f"evidence_count={len(evidence_records)}"
         )
 
         return result
@@ -398,8 +369,14 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
                 r = sr.get("result", {})
                 if isinstance(r, dict):
                     level = r.get("risk_level", "")
-                    if level in RISK_TO_ACTION:
-                        return level
+                    if level:
+                        return str(level).lower()
+            if sr.get("name") == "risk_rule_check":
+                r = sr.get("result", {})
+                if isinstance(r, dict):
+                    level = r.get("risk_level", "")
+                    if level:
+                        return str(level).lower()
         return "unknown"
 
     def _extract_evidence(
@@ -548,6 +525,54 @@ class GeneratorAgent(BaseAgent, SkillRegistryMixin):
     # =========================================================================
     # 工具方法
     # =========================================================================
+
+    def _determine_urgency(
+        self,
+        risk_level: str,
+        tool_results: List[Dict[str, Any]],
+        evidence_records: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        """Normalize tool findings into the top-level MakerOutput urgency."""
+
+        risk = str(risk_level or "").lower()
+        if risk in {"critical", "emergency", "high", "red", "urgent_care"}:
+            return "emergency"
+        if risk in {"moderate", "medium", "urgent"}:
+            return "urgent"
+        if risk in {"low", "mild"}:
+            return "self_care"
+
+        for sr in tool_results:
+            name = str(sr.get("name", ""))
+            r = sr.get("result", {})
+            if not isinstance(r, dict):
+                continue
+            recommendation = str(r.get("recommendation") or r.get("action") or "").lower()
+            if recommendation in {"urgent_care", "emergency", "recommend_urgent_care"}:
+                return "emergency"
+            if name == "drug_safety_lookup":
+                severity = str(r.get("severity") or r.get("risk_level") or "").lower()
+                if severity in {"high", "major", "contraindicated"}:
+                    return "urgent"
+            if name in {
+                "lab_reference_lookup",
+                "imaging_reference_lookup",
+                "vital_sign_reference_lookup",
+            }:
+                return "routine"
+            if name == "recommend_lifestyle":
+                return "self_care"
+
+        evidence_types = {
+            str(item.get("evidence_type") or "").lower()
+            for item in evidence_records or []
+            if isinstance(item, dict)
+        }
+        if evidence_types & {"lab_reference", "imaging_reference", "vital_sign_reference"}:
+            return "routine"
+        if evidence_types & {"guideline", "clinical_guideline", "medical_kb", "knowledge"}:
+            return "education_only"
+        return "uncertain"
 
     @staticmethod
     def _has_tool_call(

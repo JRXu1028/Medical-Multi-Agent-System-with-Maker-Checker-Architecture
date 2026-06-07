@@ -95,7 +95,7 @@ class FakeAgent:
         return input_data["question"]
 
     def get_tools_for_llm(self):
-        return []
+        return self.config.get("tools_for_llm", [])
 
     async def execute_tool(self, tool_name, arguments):
         return {"success": True}
@@ -202,3 +202,55 @@ def test_parse_requested_skills_handles_fenced_json():
         "symptom_triage",
         "evidence_research",
     ]
+
+
+@pytest.mark.asyncio
+async def test_cluster_hybrid_resolver_loads_skills_without_selection_llm_and_filters_tools():
+    with local_temp_dir() as skills_dir:
+        write_skill(skills_dir, "symptom_triage", "# Symptom\n症状方法论")
+        write_skill(skills_dir, "emergency_red_flags", "# Emergency\n急症方法论")
+        write_skill(skills_dir, "health_education", "# Education\n科普方法论")
+
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "assess_risk", "parameters": {"type": "object"}},
+            },
+            {
+                "type": "function",
+                "function": {"name": "medical_kb_search", "parameters": {"type": "object"}},
+            },
+            {
+                "type": "function",
+                "function": {"name": "deep_research", "parameters": {"type": "object"}},
+            },
+        ]
+        llm_client = FakeLLMClient('{"requested_skills": ["health_education"]}')
+        agent = FakeAgent(
+            llm_client,
+            {
+                "progressive_skills_enabled": True,
+                "skill_selection_strategy": "cluster_hybrid",
+                "tool_visibility_control_enabled": True,
+                "skill_docs_dir": str(skills_dir),
+                "temperature": 0.0,
+                "tools_for_llm": tools,
+            },
+        )
+        loop = AgentLoop(max_iterations=1, max_tool_calls=1)
+
+        result = await loop.run(agent, {"question": "我胸痛还呼吸困难怎么办？"})
+
+        assert llm_client.chat_calls == []  # 本地 resolver 不调用 selection LLM
+        assert set(result["process_trace"]["loaded_skills"]) >= {
+            "symptom_triage",
+            "emergency_red_flags",
+        }
+        tool_call_payload = llm_client.chat_with_tools_calls[0]["tools"]
+        visible_tool_names = {
+            item["function"]["name"] for item in tool_call_payload
+        }
+        assert "assess_risk" in visible_tool_names
+        assert "medical_kb_search" in visible_tool_names
+        assert "deep_research" not in visible_tool_names
+        assert result["process_trace"]["tool_visibility"]["enabled"] is True

@@ -20,6 +20,9 @@ def test_generator_registers_modern_structured_tools():
     assert "drug_safety_lookup" in registered
     assert "lab_reference_lookup" in registered
     assert "memory_context_lookup" in registered
+    assert "risk_rule_check" in registered
+    assert "imaging_reference_lookup" in registered
+    assert "vital_sign_reference_lookup" in registered
 
     openai_tools = agent.get_tools_for_llm()
     memory_tool = next(

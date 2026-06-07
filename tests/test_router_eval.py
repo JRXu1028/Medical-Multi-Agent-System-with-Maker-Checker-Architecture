@@ -41,7 +41,8 @@ def test_semantic_layer_available_or_degraded():
     if score is None:
         decision = route("多喝水有什么好处")
         assert decision.degraded
-        assert decision.source == "rule_degraded"
+        assert decision.source == "rule"
+        assert decision.degraded_reason == "semantic_unavailable"
     else:
         assert isinstance(score, float)
 

@@ -436,6 +436,7 @@ def _llm_route_decision(question: str, semantic_score: Optional[float]) -> Route
             triggers=[f"llm_unavailable:{type(exc).__name__}", f"semantic_score={semantic_score}"],
             source="llm",
             degraded=True,
+            degraded_reason="llm_unavailable",
         )
 
 
@@ -461,8 +462,9 @@ def _with_rule_degradation_probe(decision: RouteDecision, question: str) -> Rout
         mode=decision.mode,
         reason=decision.reason,
         triggers=decision.triggers,
-        source="rule_degraded",
+        source="rule",
         degraded=True,
+        degraded_reason="semantic_unavailable",
     )
 
 
@@ -540,6 +542,7 @@ async def route_async(question: str) -> RouteDecision:
             triggers=[f"llm_unavailable:{type(exc).__name__}", f"semantic_score={score}"],
             source="llm",
             degraded=True,
+            degraded_reason="llm_unavailable",
         )
 
 

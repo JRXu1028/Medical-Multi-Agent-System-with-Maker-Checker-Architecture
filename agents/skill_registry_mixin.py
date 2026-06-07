@@ -57,11 +57,20 @@ class SkillRegistryMixin:
 
         from tools.drug_safety_lookup import DRUG_SAFETY_LOOKUP_SPEC, drug_safety_lookup
         from tools.guideline_search import GUIDELINE_SEARCH_SPEC, guideline_search
+        from tools.imaging_reference_lookup import (
+            IMAGING_REFERENCE_LOOKUP_SPEC,
+            imaging_reference_lookup,
+        )
         from tools.lab_reference_lookup import LAB_REFERENCE_LOOKUP_SPEC, lab_reference_lookup
         from tools.medical_kb_search import MEDICAL_KB_SEARCH_SPEC, medical_kb_search
         from tools.memory_context_lookup import (
             MEMORY_CONTEXT_LOOKUP_SPEC,
             memory_context_lookup,
+        )
+        from tools.risk_rule_check import RISK_RULE_CHECK_SPEC, risk_rule_check
+        from tools.vital_sign_reference_lookup import (
+            VITAL_SIGN_REFERENCE_LOOKUP_SPEC,
+            vital_sign_reference_lookup,
         )
 
         structured_tools = [
@@ -70,6 +79,9 @@ class SkillRegistryMixin:
             (DRUG_SAFETY_LOOKUP_SPEC, drug_safety_lookup),
             (LAB_REFERENCE_LOOKUP_SPEC, lab_reference_lookup),
             (MEMORY_CONTEXT_LOOKUP_SPEC, memory_context_lookup),
+            (RISK_RULE_CHECK_SPEC, risk_rule_check),
+            (IMAGING_REFERENCE_LOOKUP_SPEC, imaging_reference_lookup),
+            (VITAL_SIGN_REFERENCE_LOOKUP_SPEC, vital_sign_reference_lookup),
         ]
 
         for spec, func in structured_tools:

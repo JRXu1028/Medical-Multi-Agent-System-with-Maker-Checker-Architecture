@@ -68,9 +68,6 @@ from agents.base import BaseAgent
 from agents.skill_registry_mixin import SkillRegistryMixin
 from core.prestop_policy import PreStopPolicy, PreStopResult
 
-from pipeline.action_signal import ActionType
-
-
 CHECKER_ISSUE_TYPES = frozenset({
     "TOOL_GAP",
     "EVIDENCE_GAP",
@@ -339,19 +336,22 @@ class ReviewerAgent(BaseAgent, SkillRegistryMixin):
         这些输入来自 Maker 的结构化输出；Reviewer 不读取 Maker 的完整对话历史，
         因此仍然保持上下文隔离。
         """
-        action_signal = generator_output.get("action_signal")
         evidence = list(generator_output.get("evidence_records", []) or [])
-        if isinstance(action_signal, dict):
-            evidence.extend(action_signal.get("evidence", []) or [])
 
         process_trace = generator_output.get("process_trace", {}) or {}
+        urgency = generator_output.get("urgency")
+        legacy_signal = generator_output.get("action_signal")
+        if isinstance(legacy_signal, dict):
+            if urgency is None and legacy_signal.get("proposed_action"):
+                urgency = "emergency" if "urgent" in str(legacy_signal.get("proposed_action")) else "routine"
+            evidence.extend(legacy_signal.get("evidence", []) or [])
 
         return self.prestop_policy.before_review(
             user_query=str(generator_output.get("user_query", "")),
             route_decision=generator_output.get("route_decision"),
             tool_trace=process_trace.get("tool_trace", []) or [],
             evidence=evidence,
-            action_signal=action_signal,
+            urgency=urgency,
             draft_answer=generator_output.get("answer"),
         )
 
@@ -392,7 +392,6 @@ class ReviewerAgent(BaseAgent, SkillRegistryMixin):
         Checker 可以看到 loaded_skills / tool_trace / evidence_records，
         因而能审查“加载的方法论”和“实际工具路径”是否一致。
         """
-        signal = gen_output.get("action_signal", {}) or {}
         process_trace = gen_output.get("process_trace", {}) or {}
         loaded_skills = process_trace.get("loaded_skills", []) or []
         tool_trace = process_trace.get("tool_trace", []) or []
@@ -408,8 +407,8 @@ class ReviewerAgent(BaseAgent, SkillRegistryMixin):
 ## Maker Draft Answer
 {gen_output.get("answer", "")}
 
-## Action Signal
-{json.dumps(signal, ensure_ascii=False, indent=2)}
+## Urgency
+{json.dumps(gen_output.get("urgency", "uncertain"), ensure_ascii=False, indent=2)}
 
 ## Loaded Skills
 {json.dumps(loaded_skills, ensure_ascii=False, indent=2)}

@@ -184,6 +184,59 @@ async def test_lab_reference_lookup_handles_service_failure(monkeypatch):
     assert "vector store unavailable" in result["error"]
 
 
+@pytest.mark.asyncio
+async def test_risk_rule_check_returns_structured_risk_result():
+    import tools.risk_rule_check as module
+
+    result = await module.risk_rule_check("我胸痛还呼吸困难，现在怎么办？")
+
+    assert result["tool_name"] == "risk_rule_check"
+    assert result["success"] is True
+    assert result["data"]["risk_level"] == "high"
+    assert "emergency_symptoms" in result["data"]["matched_rules"]
+    assert result["evidence"] == []
+
+
+@pytest.mark.asyncio
+async def test_imaging_reference_lookup_returns_tool_result(monkeypatch):
+    import tools.imaging_reference_lookup as module
+
+    fake_service = FakeEvidenceService()
+    monkeypatch.setattr(module, "get_evidence_service", lambda: fake_service)
+
+    result = await module.imaging_reference_lookup("胸部 CT 肺结节", max_results=2)
+
+    assert result["tool_name"] == "imaging_reference_lookup"
+    assert result["success"] is True
+    assert result["evidence"][0]["evidence_type"] == "imaging_reference"
+    assert fake_service.last_call == {
+        "query": "胸部 CT 肺结节 影像报告 CT MRI 超声 X线 结节 复查 随访",
+        "top_k": 2,
+        "filter_type": None,
+        "evidence_type": "imaging_reference",
+    }
+
+
+@pytest.mark.asyncio
+async def test_vital_sign_reference_lookup_returns_tool_result(monkeypatch):
+    import tools.vital_sign_reference_lookup as module
+
+    fake_service = FakeEvidenceService()
+    monkeypatch.setattr(module, "get_evidence_service", lambda: fake_service)
+
+    result = await module.vital_sign_reference_lookup("血氧 92 心率快", max_results=2)
+
+    assert result["tool_name"] == "vital_sign_reference_lookup"
+    assert result["success"] is True
+    assert result["evidence"][0]["evidence_type"] == "vital_sign_reference"
+    assert fake_service.last_call == {
+        "query": "血氧 92 心率快 血压 血氧 心率 体温 心电图 房颤 ST段 风险边界",
+        "top_k": 2,
+        "filter_type": None,
+        "evidence_type": "vital_sign_reference",
+    }
+
+
 def load_legacy_module(relative_path: str, module_name: str):
     """按文件路径加载 legacy skill wrapper，避免受包名里的连字符影响。"""
     import importlib.util

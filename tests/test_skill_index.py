@@ -123,13 +123,32 @@ def test_real_skill_docs_are_compact_methodology_docs():
 
     expected = {
         "symptom_triage",
+        "emergency_red_flags",
+        "mental_health_safety",
+        "clarifying_questions",
+        "care_navigation",
         "medication_safety",
+        "drug_interaction",
+        "renal_liver_dose_safety",
+        "pregnancy_pediatric_safety",
+        "geriatric_safety",
         "lab_report",
+        "imaging_report",
+        "ecg_vital_signs",
+        "guideline_research",
+        "evidence_comparison",
+        "source_quality_appraisal",
         "health_education",
-        "lifestyle_chronic_care",
-        "evidence_research",
+        "preventive_care",
+        "medical_device_explainer",
+        "chronic_care",
+        "lifestyle_coaching",
+        "nutrition_weight_management",
+        "rehabilitation_exercise_safety",
+        "memory_personalization",
     }
     assert expected.issubset(set(docs.keys()))
+    assert len(expected) == 24
 
     for doc in docs.values():
         assert doc.description
@@ -146,10 +165,10 @@ def test_real_skill_context_can_batch_load_multiple_docs():
     loader = SkillDocLoader(root / "skills")
 
     context, loaded_ids = loader.render_skill_context(
-        ["symptom_triage", "evidence_research"]
+        ["symptom_triage", "guideline_research"]
     )
 
-    assert loaded_ids == ["symptom_triage", "evidence_research"]
+    assert loaded_ids == ["symptom_triage", "guideline_research"]
     assert "Skill: symptom_triage" in context
-    assert "Skill: evidence_research" in context
+    assert "Skill: guideline_research" in context
     assert "不是可执行工具" in context

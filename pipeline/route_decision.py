@@ -1,15 +1,19 @@
-"""Router 决策结果 dataclass。
+"""Router 决策结果契约。
 
-Router 只负责"监督层级选择"——决定是否需要更严格的审查。
-不输出 risk_level（Generator 的职责，通过 assess_risk Skill 完成）。
-不输出 confidence（Phase 1 纯规则，无不确定性）。
+Router 只负责“监督等级选择”：判断用户问题走快速 simple 路径，
+还是进入更严格的 maker_checker 路径。它不输出 risk_level、intent、
+skills 或 tools，避免把 Maker 退化成固定工作流执行器。
 """
 
 from dataclasses import dataclass, field
-from typing import List, Literal
+from typing import List, Literal, Optional
 
-RouteMode   = Literal["simple", "maker_checker"]          # 路由模式
-RouteSource = Literal["rule", "semantic", "llm", "rule_degraded"]  # 决策来源
+
+RouteMode = Literal["simple", "maker_checker"]
+"""路由模式：simple 表示快速路径，maker_checker 表示进入审查链路。"""
+
+RouteSource = Literal["rule", "semantic", "llm"]
+"""决策来源：只表示“谁做出了路由决策”，不混入降级状态。"""
 
 
 @dataclass(frozen=True)
@@ -18,19 +22,20 @@ class RouteDecision:
 
     Parameters
     ----------
-    mode : RouteMode
-        "simple"       — Generator → SafetyGate → ResponseRenderer
-        "maker_checker" — Generator → Reviewer → SafetyGate → ResponseRenderer
-    reason : str
-        人类可读的决策原因，用于日志和终端展示。
-    triggers : list of str
-        触发了哪些规则，用于调试和可解释性。
-    source : RouteSource
-        "rule" — 确定性规则匹配。
-        "semantic" — 语义层召回。
-        "rule_degraded" — 语义层不可用，仅规则层决策。
-    degraded : bool
-        True 表示系统以降级模式运行（语义层不可用）。
+    mode:
+        路由模式。
+    reason:
+        人类可读的决策原因，用于日志、终端展示和 trace。
+    triggers:
+        触发该决策的信号。规则层通常记录命中的标签和关键词；
+        semantic/llm 层通常记录语义分数、LLM 模式或失败原因。
+    source:
+        决策来源，只能是 rule / semantic / llm。
+    degraded:
+        系统是否在降级状态下完成决策，例如语义层或 LLM fallback 不可用。
+    degraded_reason:
+        可选的降级原因。它和 source 解耦：source 仍表示谁做决策，
+        degraded_reason 表示哪些能力不可用。
     """
 
     mode: RouteMode
@@ -38,6 +43,7 @@ class RouteDecision:
     triggers: List[str] = field(default_factory=list)
     source: RouteSource = "rule"
     degraded: bool = False
+    degraded_reason: Optional[str] = None
 
     @property
     def is_simple(self) -> bool:

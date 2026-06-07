@@ -67,22 +67,27 @@ def test_before_final_ignores_failed_required_tool_call():
     assert result.issues[0].missing_tools == ["assess_risk"]
 
 
-def test_before_review_repairs_missing_action_signal():
+def test_before_review_repairs_missing_urgency():
     policy = PreStopPolicy()
 
     result = policy.before_review(
         user_query="普通健康科普",
         tool_trace=[],
         evidence=[],
-        action_signal=None,
+        urgency=None,
         draft_answer="draft",
     )
 
     assert result.status == PreStopStatus.REPAIR
-    assert result.issues[0].type == PreStopIssueType.MISSING_ACTION_SIGNAL
+    assert result.issues[0].type == PreStopIssueType.MISSING_URGENCY
 
 
-def test_before_review_repairs_high_confidence_without_evidence():
+def test_before_review_passes_when_urgency_derived_from_legacy_action_signal():
+    """With evidence_strength removed, PreStopPolicy only checks urgency presence.
+
+    High-confidence-without-evidence is now the Checker LLM's responsibility,
+    not PreStopPolicy's deterministic precheck.
+    """
     policy = PreStopPolicy()
 
     result = policy.before_review(
@@ -98,10 +103,7 @@ def test_before_review_repairs_high_confidence_without_evidence():
         draft_answer="draft",
     )
 
-    assert result.status == PreStopStatus.REPAIR
-    assert result.reject_type == PreStopRejectType.NEED_MORE_EVIDENCE
-    assert result.issues[0].type == PreStopIssueType.EVIDENCE_GAP
-    assert result.issues[0].audit_scope == "evidence_path"
+    assert result.status == PreStopStatus.PASS
 
 
 def test_before_review_passes_with_low_confidence_without_evidence():

@@ -49,14 +49,12 @@ async def test_post_process_result_extracts_structured_evidence_records():
     )
 
     assert result["evidence_records"][0]["id"] == "g1"
-    assert result["action_signal"]["evidence_ids"] == ["g1"]
-    assert "evidence_records" not in result["action_signal"]
+    assert result["urgency"] == "education_only"
+    assert "action_signal" not in result
     assert "loaded_skills" not in result
     assert "tool_trace" not in result
     assert "skill_trace" not in result
     assert result["process_trace"]["tool_summary"][0]["tool"] == "clinical_guideline"
-    assert any("高血压诊疗指南" in item for item in result["action_signal"]["evidence"])
-    assert all(isinstance(item, str) for item in result["action_signal"]["evidence"])
 
 
 def test_extract_evidence_records_deduplicates_nested_tool_result():
